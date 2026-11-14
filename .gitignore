@@ -1,0 +1,33 @@
+# Legacy source pipeline and raw inputs; the app uses knowledge_base/ instead.
+/data/
+/pipeline/
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+secrets/*.toml
+!secrets/*.example.toml
+
+# Downloaded weights, caches and generated vector indexes
+models/embedding/*
+!models/embedding/.gitkeep
+*.safetensors
+knowledge_base/indices/
+knowledge_base/corpora/jolpica.jsonl
+.cache/
+
+# Existing local tooling state
+.hermes/

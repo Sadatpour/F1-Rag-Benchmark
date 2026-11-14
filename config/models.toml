@@ -1,0 +1,16 @@
+[embedding]
+repo_id = "sentence-transformers/all-MiniLM-L6-v2"
+local_path = "models/embedding/all-MiniLM-L6-v2"
+weights_path = "models/embedding/all-MiniLM-L6-v2/model.safetensors"
+
+[openrouter]
+answer_models = [
+    "cohere/north-mini-code:free",
+    "google/gemma-4-31b-it:free",
+]
+judge_model = "nvidia/nemotron-3.5-lightning:free"
+query_rewrite_model = "cohere/north-mini-code:free"
+additional_models = []
+
+[context_windows]
+# Optionally pin or override context lengths (tokens) when OpenRouter has no catalog value.

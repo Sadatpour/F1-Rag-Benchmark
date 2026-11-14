@@ -1,0 +1,8 @@
+{
+  "source": "F1-Dataset data/raw and data/final/qa.jsonl",
+  "documents": {
+    "wikipedia": 1050,
+    "jolpica": 104094,
+    "evaluation": 10656
+  }
+}
