@@ -5,6 +5,7 @@ from urllib.parse import quote
 
 JOLPICA_API_BASE = "https://api.jolpi.ca/ergast/f1"
 JOLPICA_ATTRIBUTION = "Jolpica F1 API (Ergast-compatible)"
+WIKIPEDIA_ARTICLE_BASE = "https://en.wikipedia.org/wiki/"
 
 
 def jolpica_source_url(source: str) -> str:
@@ -22,3 +23,11 @@ def jolpica_source_url(source: str) -> str:
         parts = [parts[0]]
     path = "/".join(quote(part, safe="") for part in parts)
     return f"{JOLPICA_API_BASE}/{path}/?format=json"
+
+
+def wikipedia_source_url(title: str) -> str:
+    """Return a canonical English Wikipedia URL for a page title."""
+    normalized_title = title.strip().replace(" ", "_")
+    if not normalized_title:
+        return WIKIPEDIA_ARTICLE_BASE
+    return WIKIPEDIA_ARTICLE_BASE + quote(normalized_title, safe="()!,~*'-._")

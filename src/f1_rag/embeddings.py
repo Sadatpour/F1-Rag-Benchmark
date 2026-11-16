@@ -53,6 +53,18 @@ class MeanPoolingEncoder:
         return np.concatenate(vectors).astype(np.float32, copy=False)
 
 
+def embedding_tokenizer(embedder: Any) -> tuple[Any, int]:
+    tokenizer = getattr(embedder, "tokenizer", None)
+    if tokenizer is None:
+        first_module = getattr(embedder, "_first_module", None)
+        if callable(first_module):
+            tokenizer = getattr(first_module(), "tokenizer", None)
+    max_length = getattr(embedder, "max_length", None) or getattr(embedder, "max_seq_length", None)
+    if tokenizer is None or not isinstance(max_length, int) or max_length < 1:
+        raise RuntimeError("The embedding model does not expose its tokenizer and maximum sequence length.")
+    return tokenizer, max_length
+
+
 def load_embedding_model(
     model_id: str = EMBEDDING_MODEL_ID,
     model_path: Path = EMBEDDING_MODEL_PATH,
@@ -66,7 +78,9 @@ def load_embedding_model(
                 "Embedding dependencies are missing. Install them with "
                 "`python -m pip install -r requirements-embedding.txt`."
             ) from error
-        return SentenceTransformer(str(model_path))
+        model = SentenceTransformer(str(model_path))
+        model.max_seq_length = min(int(model.max_seq_length), 256)
+        return model
 
     try:
         import torch

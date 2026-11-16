@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from f1_rag.sources import JOLPICA_API_BASE, jolpica_source_url
+from f1_rag.sources import JOLPICA_API_BASE, jolpica_source_url, wikipedia_source_url
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -72,6 +72,7 @@ def _wiki_records(path: Path) -> Iterator[dict[str, Any]]:
             "source": f"Wikipedia:{source_title}",
             "source_file": path.name,
             "title": title,
+            "source_url": wikipedia_source_url(source_title),
         }
 
 
@@ -213,14 +214,18 @@ def build_knowledge_base(source_root: Path = SOURCE_DATA, output_root: Path = KN
     return counts
 
 
-def load_documents(dataset: str, knowledge_base: Path = KNOWLEDGE_BASE) -> list[dict[str, Any]]:
+def iter_documents(dataset: str, knowledge_base: Path = KNOWLEDGE_BASE) -> Iterator[dict[str, Any]]:
     path = resolve_corpus_path(dataset, knowledge_base)
     if not path.is_file():
         raise FileNotFoundError(
             f"Missing {path} (or its .gz archive). Restore the original data sources before running "
             "`python -m f1_rag.ingest` to rebuild the knowledge base."
         )
-    return list(_read_jsonl(path))
+    yield from _read_jsonl(path)
+
+
+def load_documents(dataset: str, knowledge_base: Path = KNOWLEDGE_BASE) -> list[dict[str, Any]]:
+    return list(iter_documents(dataset, knowledge_base))
 
 
 if __name__ == "__main__":

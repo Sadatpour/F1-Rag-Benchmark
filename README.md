@@ -67,15 +67,16 @@ streamlit run app.py
 
 - Select Wikipedia or Jolpica as the knowledge source.
 - Compare answers across multiple LLMs and three vector stores: exact NumPy cosine, FAISS, and ChromaDB.
-- Configure chunk sizes of 500, 750, or 1,000 words, chunk overlap, and 1–10 retrieved chunks.
+- Configure embedding-token chunk sizes (128, 192, or 224), token overlap, and 1–10 retrieved chunks. The chunks use the embedding model tokenizer and stay below its 256-token input limit.
 - Optionally rewrite the query before embedding.
-- Choose a separate model to judge answer correctness.
-- Measure Recall@10 and NDCG@10, and estimate QA accuracy on a configurable sample.
+- Toggle answer judging on or off, and choose a separate judge model when enabled.
+- Measure reference-source hit@10 and source-level NDCG@10, and estimate QA accuracy on a stratified sample of 10–100 questions.
+- Build indexes by streaming corpus records and embedding batches with visible progress. Wikipedia remains the default source for a smaller first index.
 - View each configured model's context window when OpenRouter provides it.
 
 ### Jolpica attribution
 
-Whenever Jolpica is selected, the dashboard identifies the data source as the [Jolpica F1 API (Ergast-compatible)](https://api.jolpi.ca/ergast/f1/). Retrieved Jolpica records include a direct API endpoint link; the source name and URL are also supplied to the answer and judge models.
+Whenever Jolpica is selected, the dashboard identifies the data source as the [Jolpica F1 API (Ergast-compatible)](https://api.jolpi.ca/ergast/f1/). Retrieved Jolpica records include a direct API endpoint link; Wikipedia records include canonical article links. Source names and URLs are also supplied to the answer and judge models.
 
 ### Optional vector stores
 
@@ -89,7 +90,9 @@ If the FAISS wheel is incompatible with your Python/Windows setup, use NumPy or 
 
 Generated indexes are rebuildable, stored under `knowledge_base/indices/`, and excluded from Git. The self-contained corpus and QA files remain in the repository so it can be published without the original raw data.
 
-> **Evaluation note:** Each QA row contains a source label rather than a full set of relevant document IDs. Recall@10 and NDCG@10 currently use source matching; a qrels file with relevant document IDs would enable stricter information-retrieval evaluation.
+> **Evaluation note:** Each QA row contains one source label rather than a complete set of relevant document or chunk IDs. The reported reference-source hit rate checks whether that source appears in the first 10 results, and NDCG deduplicates results at the source level. Neither is standard document/chunk Recall@10 or NDCG@10. A judged qrels file with all relevant IDs per question is needed for strict information-retrieval metrics. QA accuracy is a stratified sample estimate, not a corpus-wide score; LLM judgments should be calibrated with human review.
+
+> **Context and prompt safety:** Answer context is budgeted conservatively using UTF-8 byte counts, reserving room for system instructions, the question, and the maximum answer. Retrieved documents are explicitly treated as untrusted data, and citations are limited to references included in the prompt.
 
 ## Tests
 
