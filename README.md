@@ -69,7 +69,7 @@ streamlit run app.py
 - Compare answers across multiple LLMs and three vector stores: exact NumPy cosine, FAISS, and ChromaDB.
 - Configure chunk sizes of 500, 750, or 1,000 words, chunk overlap, and 1–10 retrieved chunks.
 - Optionally rewrite the query before embedding.
-- Choose a separate model to judge answer correctness.
+- Toggle answer judging on or off, and choose a separate judge model when enabled.
 - Measure Recall@10 and NDCG@10, and estimate QA accuracy on a configurable sample.
 - View each configured model's context window when OpenRouter provides it.
 

@@ -236,8 +236,11 @@ def answer_question(
                 "role": "system",
                 "content": (
                     "You are a Formula 1 research assistant. Answer in English and only from the supplied context. "
-                    "If it does not support a reliable answer, say so. Cite factual claims with the "
-                    "provided [n] references. Preserve the supplied source names and URLs; never invent links."
+                    "Use relevant evidence even when it answers the question indirectly. If the context only "
+                    "partially answers the question, explain what it supports and identify which details are "
+                    "missing; do not say there is no relevant information when the context contains useful "
+                    "evidence. Do not infer missing results from section headings alone. Cite factual claims with "
+                    "the provided [n] references. Preserve the supplied source names and URLs; never invent links."
                 ),
             },
             {

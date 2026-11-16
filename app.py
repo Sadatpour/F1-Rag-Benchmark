@@ -301,10 +301,16 @@ with st.sidebar:
         default=[model for model in DEFAULT_MODELS[:2] if model in model_options],
         help="A model is queried once per selected vector store.",
     )
+    judge_enabled = st.toggle(
+        "Use judge model",
+        value=True,
+        help="Turn this off to skip judge calls in answer comparisons and QA accuracy runs.",
+    )
     judge_model = st.selectbox(
         "Judge model",
         model_options,
         index=model_options.index(DEFAULT_JUDGE_MODEL) if DEFAULT_JUDGE_MODEL in model_options else 0,
+        disabled=not judge_enabled,
     )
     rewrite_enabled = st.toggle("Rewrite query before embedding", value=False)
     rewrite_model = st.selectbox(
@@ -326,7 +332,12 @@ with st.sidebar:
 
     st.space("small")
     st.markdown("**Model context windows**")
-    for model in dict.fromkeys((*selected_models, judge_model, *((rewrite_model,) if rewrite_enabled else ()))):
+    context_models = (
+        *selected_models,
+        *((judge_model,) if judge_enabled else ()),
+        *((rewrite_model,) if rewrite_enabled else ()),
+    )
+    for model in dict.fromkeys(context_models):
         context = _context_window(model)
         context_label = f"{int(context):,} tokens" if isinstance(context, (int, float)) else "not listed"
         st.caption(f"`{model}` · {context_label}")
@@ -456,23 +467,24 @@ with query_tab:
                             payload["errors"][key] = str(error)
                             continue
 
-                        try:
-                            with st.spinner(f"Judging {model} · {store_name}…"):
-                                verdict = judge_answer(
-                                    payload["question"],
-                                    "\n\n".join(
-                                        f"Source: {hit.get('source', 'unknown')}\n"
-                                        f"Source URL: {hit.get('source_url', '')}\n"
-                                        f"{hit.get('text', '')}"
-                                        for hit in hits
-                                    ),
-                                    response,
-                                    judge_model,
-                                    api_key,
-                                )
-                            payload["answers"][key]["judge"] = verdict
-                        except (RuntimeError, ValueError) as error:
-                            payload["errors"][f"{key} judge"] = str(error)
+                        if judge_enabled:
+                            try:
+                                with st.spinner(f"Judging {model} · {store_name}…"):
+                                    verdict = judge_answer(
+                                        payload["question"],
+                                        "\n\n".join(
+                                            f"Source: {hit.get('source', 'unknown')}\n"
+                                            f"Source URL: {hit.get('source_url', '')}\n"
+                                            f"{hit.get('text', '')}"
+                                            for hit in hits
+                                        ),
+                                        response,
+                                        judge_model,
+                                        api_key,
+                                    )
+                                payload["answers"][key]["judge"] = verdict
+                            except (RuntimeError, ValueError) as error:
+                                payload["errors"][f"{key} judge"] = str(error)
             st.session_state["last_comparison"] = payload
 
     payload = st.session_state.get("last_comparison")
@@ -484,6 +496,8 @@ with query_tab:
             st.error(payload["errors"]["retrieval"])
         for key, message in payload["errors"].items():
             if key != "retrieval":
+                if key.endswith(" judge") and not judge_enabled:
+                    continue
                 st.error(f"{key}: {message}")
 
         for store_name, hits in payload["hits"].items():
@@ -499,7 +513,7 @@ with query_tab:
                     if result:
                         st.write(result["text"])
                         _render_source_citations(hits)
-                        verdict = result["judge"]
+                        verdict = result["judge"] if judge_enabled else None
                         if verdict:
                             st.badge(
                                 "Correct" if verdict["correct"] else "Needs review",
@@ -570,12 +584,14 @@ with eval_tab:
 
     st.space("medium")
     st.markdown("#### QA accuracy (LLM judge)")
+    if not judge_enabled:
+        st.info("Enable the judge model in the sidebar to run QA accuracy evaluation.")
     accuracy_count = st.slider("QA accuracy sample", min_value=1, max_value=10, value=3)
     accuracy_model = st.selectbox("Model to evaluate", selected_models or model_options, key="accuracy_model")
     accuracy_store = st.selectbox("Vector store to evaluate", store_names or ("NumPy (exact)",), key="accuracy_store")
     accuracy_button = st.button(
         "Evaluate answers with judge",
-        disabled=not api_key or not store_names or not selected_models,
+        disabled=not judge_enabled or not api_key or not store_names or not selected_models,
     )
     if accuracy_button:
         if not eval_pool:
@@ -617,7 +633,7 @@ with eval_tab:
                 st.error(f"QA accuracy run failed: {error}")
             progress.empty()
     verdicts = st.session_state.get("qa_verdicts", [])
-    if verdicts:
+    if judge_enabled and verdicts:
         st.metric("QA accuracy", f"{qa_accuracy(verdicts):.1%}", f"{len(verdicts)} judged questions")
         with st.expander("QA judge details"):
             for verdict in verdicts:
