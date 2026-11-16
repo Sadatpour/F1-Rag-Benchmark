@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import sys
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +14,14 @@ ROOT = Path(__file__).resolve().parent
 LOGGER = logging.getLogger(__name__)
 sys.path.insert(0, str(ROOT / "src"))
 
-from f1_rag.embeddings import EMBEDDING_MODEL_ID, EMBEDDING_MODEL_PATH, EMBEDDING_WEIGHTS_PATH, load_embedding_model
-from f1_rag.evaluation import ndcg_at_n, qa_accuracy, recall_at_n
-from f1_rag.ingest import KNOWLEDGE_BASE, load_documents, resolve_corpus_path
+from f1_rag.embeddings import (
+    EMBEDDING_MODEL_ID,
+    EMBEDDING_MODEL_PATH,
+    EMBEDDING_WEIGHTS_PATH,
+    load_embedding_model,
+)
+from f1_rag.evaluation import ndcg_at_n, qa_accuracy, recall_at_n, stratified_sample
+from f1_rag.ingest import KNOWLEDGE_BASE, iter_documents, resolve_corpus_path
 from f1_rag.openrouter import (
     ADDITIONAL_MODELS,
     CONTEXT_WINDOW_OVERRIDES,
@@ -29,8 +34,14 @@ from f1_rag.openrouter import (
     list_models,
     rewrite_query,
 )
-from f1_rag.retrieval import encode_query, load_evaluation_rows, prepare_index
-from f1_rag.sources import JOLPICA_API_BASE, JOLPICA_ATTRIBUTION, jolpica_source_url
+from f1_rag.retrieval import embed_documents, encode_query, load_evaluation_rows, prepare_index
+from f1_rag.sources import (
+    JOLPICA_API_BASE,
+    JOLPICA_ATTRIBUTION,
+    WIKIPEDIA_ARTICLE_BASE,
+    jolpica_source_url,
+    wikipedia_source_url,
+)
 
 
 st.set_page_config(
@@ -100,11 +111,11 @@ def evaluation_rows() -> list[dict[str, Any]]:
 
 @st.cache_data(show_spinner=False, max_entries=2)
 def corpus_preview(dataset: str) -> str:
-    docs = load_documents(dataset)
+    docs = islice(iter_documents(dataset), 12)
     return "\n".join(
         f"{doc.get('source', '')} ({doc.get('source_url', '')}): "
         f"{doc.get('title', doc.get('text', '')[:300])}"
-        for doc in docs[:12]
+        for doc in docs
     )
 
 
@@ -120,18 +131,27 @@ def embedded_corpus(
     overlap: int,
     corpus_size: int,
     corpus_mtime: int,
+    corpus_document_count: int,
 ) -> tuple[list[dict[str, Any]], Any]:
-    from f1_rag.chunking import chunk_documents
+    embedder = embedding_model(model_id, model_path, weights_path, weights_size, weights_mtime)
+    progress = st.progress(0, text=f"Embedding {dataset} documents in batches…")
 
-    documents = load_documents(dataset)
-    chunks = chunk_documents(documents, chunk_size=chunk_size, overlap=overlap)
-    vectors = embedding_model(model_id, model_path, weights_path, weights_size, weights_mtime).encode(
-        [chunk["text"] for chunk in chunks],
-        batch_size=64,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    )
+    try:
+        chunks, vectors = embed_documents(
+            iter_documents(dataset),
+            embedder,
+            chunk_size,
+            overlap,
+            on_progress=lambda document_index: progress.progress(
+                min(document_index / max(corpus_document_count, 1), 1.0),
+                text=f"Embedded {document_index:,}/{corpus_document_count:,} documents…",
+            ),
+        )
+    finally:
+        progress.empty()
+
+    if not chunks:
+        raise ValueError(f"The {dataset} corpus did not produce any chunks.")
     return chunks, vectors
 
 
@@ -148,6 +168,7 @@ def indexed_corpus(
     overlap: int,
     corpus_size: int,
     corpus_mtime: int,
+    corpus_document_count: int,
 ) -> tuple[Any, int, bool]:
     return prepare_index(
         dataset,
@@ -166,6 +187,7 @@ def indexed_corpus(
             overlap,
             corpus_size,
             corpus_mtime,
+            corpus_document_count,
         ),
     )
 
@@ -204,6 +226,7 @@ def _ready_index(dataset: str, store_name: str, chunk_size: int, overlap: int) -
         overlap,
         stat.st_size,
         stat.st_mtime_ns,
+        corpus_total,
     )
 
 
@@ -254,12 +277,19 @@ def _render_source_citations(hits: list[dict[str, Any]]) -> None:
         url = str(hit.get("source_url", ""))
         if source.startswith("Jolpica:") and not url.startswith(JOLPICA_API_BASE + "/"):
             url = jolpica_source_url(source)
-        if url.startswith(JOLPICA_API_BASE + "/"):
-            citations[source or JOLPICA_ATTRIBUTION] = url
+        elif source.startswith("Wikipedia:") and not url.startswith(WIKIPEDIA_ARTICLE_BASE):
+            url = wikipedia_source_url(source.removeprefix("Wikipedia:"))
+        if url.startswith((JOLPICA_API_BASE + "/", WIKIPEDIA_ARTICLE_BASE)):
+            label = (
+                f"{JOLPICA_ATTRIBUTION}: {source}"
+                if url.startswith(JOLPICA_API_BASE + "/")
+                else source
+            )
+            citations[label or JOLPICA_ATTRIBUTION] = url
     if citations:
         st.markdown("**Sources**")
         for source, url in citations.items():
-            st.markdown(f"- [{JOLPICA_ATTRIBUTION}: {source}]({url})")
+            st.markdown(f"- [{source}]({url})")
 
 
 try:
@@ -320,11 +350,16 @@ with st.sidebar:
         disabled=not rewrite_enabled,
     )
     st.space("small")
-    chunk_size = st.select_slider("Chunk size (approx. words)", options=(500, 750, 1000), value=500)
+    chunk_size = st.select_slider(
+        "Chunk size (embedding tokens)",
+        options=(128, 192, 224),
+        value=192,
+        help="Tokenized with the embedding model tokenizer; each chunk stays within its 256-token input limit.",
+    )
     overlap = st.select_slider(
-        "Chunk overlap (words)",
-        options=(50, 80, 100, 150),
-        value=80,
+        "Chunk overlap (tokens)",
+        options=(0, 16, 32, 48),
+        value=32,
     )
     if overlap >= chunk_size:
         st.error("Overlap must be smaller than the selected chunk size.")
@@ -512,7 +547,8 @@ with query_tab:
                     result = payload["answers"].get(key)
                     if result:
                         st.write(result["text"])
-                        _render_source_citations(hits)
+                        store_hits = payload["hits"].get(store_name, [])
+                        _render_source_citations(store_hits)
                         verdict = result["judge"] if judge_enabled else None
                         if verdict:
                             st.badge(
@@ -523,10 +559,10 @@ with query_tab:
                             st.caption(f"Judge note: {verdict['reason']}")
                     elif key not in payload["errors"]:
                         st.info("No answer was generated for this store/model combination.")
-                    hits = payload["hits"].get(store_name, [])
-                    if hits:
+                    store_hits = payload["hits"].get(store_name, [])
+                    if store_hits:
                         with st.expander("Retrieved evidence"):
-                            for rank, hit in enumerate(hits, start=1):
+                            for rank, hit in enumerate(store_hits, start=1):
                                 st.markdown(
                                     f"**[{rank}] {hit.get('source', 'Unknown source')}** · "
                                     f"score `{hit.get('score', 0):.3f}`"
@@ -534,15 +570,24 @@ with query_tab:
                                 source_url = hit.get("source_url")
                                 if source_url and source_url.startswith(JOLPICA_API_BASE + "/"):
                                     st.markdown(f"[View {JOLPICA_ATTRIBUTION} record]({source_url})")
+                                elif hit.get("source", "").startswith("Wikipedia:"):
+                                    wikipedia_url = (
+                                        source_url
+                                        if source_url and source_url.startswith(WIKIPEDIA_ARTICLE_BASE)
+                                        else wikipedia_source_url(
+                                            str(hit["source"]).removeprefix("Wikipedia:")
+                                        )
+                                    )
+                                    st.markdown(f"[View Wikipedia article]({wikipedia_url})")
                                 st.write(hit.get("text", ""))
-                                if rank < len(hits):
+                                if rank < len(store_hits):
                                     st.divider()
 
 with eval_tab:
     st.subheader("Retrieval & answer evaluation")
     st.caption(
-        "Recall@10 and NDCG@10 use QA reference-source matching. Answer accuracy is "
-        "estimated by an OpenRouter judge on a configurable sample."
+        "Reference-source hit@10 and source-level NDCG@10 use the single source label on each QA row; "
+        "they are not document/chunk recall. QA accuracy is a stratified sample estimate, not a corpus-wide score."
     )
     eval_pool = _dataset_questions(dataset)
     total_eval_rows = sum(
@@ -554,12 +599,12 @@ with eval_tab:
         f"for {dataset_title}"
     )
     metric_count = st.slider("Retrieval evaluation sample", min_value=10, max_value=100, value=20, step=10)
-    eval_button = st.button("Run Recall@10 / NDCG@10", type="primary", disabled=not store_names)
+    eval_button = st.button("Run source-match benchmark (top 10)", type="primary", disabled=not store_names)
     if eval_button:
         if not eval_pool:
             st.error(f"No QA rows map to the {dataset_title} corpus.")
         else:
-            sample = random.Random(42).sample(eval_pool, min(metric_count, len(eval_pool)))
+            sample = stratified_sample(eval_pool, min(metric_count, len(eval_pool)), seed=42)
             rows = []
             progress = st.progress(0, text="Preparing retrieval evaluation…")
             for index, store_name in enumerate(store_names):
@@ -578,15 +623,19 @@ with eval_tab:
         for column, result in zip(metric_columns, metrics):
             with column:
                 st.markdown(f"**{result['Vector store']}**")
-                st.metric("Recall@10", f"{result['recall@10']:.1%}")
-                st.metric("NDCG@10", f"{result['ndcg@10']:.3f}")
+                st.metric("Reference-source hit@10", f"{result['recall@10']:.1%}")
+                st.metric("Distinct-source NDCG@10", f"{result['ndcg@10']:.3f}")
                 st.caption(f"{result['questions']} questions")
 
     st.space("medium")
     st.markdown("#### QA accuracy (LLM judge)")
     if not judge_enabled:
         st.info("Enable the judge model in the sidebar to run QA accuracy evaluation.")
-    accuracy_count = st.slider("QA accuracy sample", min_value=1, max_value=10, value=3)
+    accuracy_count = st.slider("QA accuracy sample size", min_value=10, max_value=100, value=30, step=10)
+    st.caption(
+        "Questions are sampled across entity types. Treat judge results as an estimate for this sample "
+        "and calibrate them with human review."
+    )
     accuracy_model = st.selectbox("Model to evaluate", selected_models or model_options, key="accuracy_model")
     accuracy_store = st.selectbox("Vector store to evaluate", store_names or ("NumPy (exact)",), key="accuracy_store")
     accuracy_button = st.button(
@@ -597,7 +646,7 @@ with eval_tab:
         if not eval_pool:
             st.error(f"No QA rows map to the {dataset_title} corpus.")
         else:
-            sample = random.Random(7).sample(eval_pool, min(accuracy_count, len(eval_pool)))
+            sample = stratified_sample(eval_pool, min(accuracy_count, len(eval_pool)), seed=7)
             verdicts = []
             progress = st.progress(0, text="Running judged QA sample…")
             try:
@@ -660,8 +709,9 @@ with about_tab:
         """
     )
     st.info(
-        "Chunk sizes are approximate word counts. Model context windows come from the OpenRouter "
-        "catalog; unavailable values are shown as “not listed.”"
+        "Chunks are sized in tokens with the embedding model tokenizer and capped below its 256-token "
+        "input limit. First-time index builds embed documents in batches and show progress. Model context "
+        "windows come from the OpenRouter catalog; unavailable values are shown as “not listed.”"
     )
     st.markdown(
         f"Jolpica data attribution: [{JOLPICA_ATTRIBUTION}]({JOLPICA_API_BASE}/). "

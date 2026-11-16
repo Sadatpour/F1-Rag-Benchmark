@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 
 from f1_rag.chunking import chunk_documents
-from f1_rag.embeddings import EMBEDDING_MODEL_ID, EMBEDDING_MODEL_PATH, EMBEDDING_WEIGHTS_PATH
-from f1_rag.ingest import KNOWLEDGE_BASE, load_documents, resolve_corpus_path
+from f1_rag.embeddings import (
+    EMBEDDING_MODEL_ID,
+    EMBEDDING_MODEL_PATH,
+    EMBEDDING_WEIGHTS_PATH,
+    embedding_tokenizer,
+)
+from f1_rag.ingest import KNOWLEDGE_BASE, iter_documents, resolve_corpus_path
 from f1_rag.stores import create_store
 
 
@@ -24,7 +29,7 @@ def _fingerprint(corpus_path: Path, chunk_size: int, overlap: int) -> str:
         f"{weights_stat.st_size}:{weights_stat.st_mtime_ns}" if weights_stat else "not-present"
     )
     payload = (
-        f"{corpus_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
+        f"token-chunking-v2:{corpus_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
         f"{chunk_size}:{overlap}:{EMBEDDING_MODEL_ID}:{EMBEDDING_MODEL_PATH.resolve()}:"
         f"{EMBEDDING_WEIGHTS_PATH.resolve()}:{weights_signature}"
     )
@@ -34,6 +39,57 @@ def _fingerprint(corpus_path: Path, chunk_size: int, overlap: int) -> str:
 def _index_path(dataset: str, store_name: str, fingerprint: str) -> Path:
     safe_store = store_name.lower().replace(" ", "-").replace("(", "").replace(")", "")
     return INDEX_ROOT / dataset / safe_store / fingerprint[:16]
+
+
+def embed_documents(
+    documents: Iterable[dict[str, Any]],
+    embedder: Any,
+    chunk_size: int,
+    overlap: int,
+    batch_size: int = 128,
+    on_progress: Callable[[int], None] | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be greater than zero.")
+    tokenizer, max_tokens = embedding_tokenizer(embedder)
+    chunks: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    vector_batches: list[np.ndarray] = []
+    document_count = 0
+
+    def encode_batch(batch: list[dict[str, Any]]) -> None:
+        vector_batches.append(
+            embedder.encode(
+                [chunk["text"] for chunk in batch],
+                batch_size=64,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
+        )
+
+    for document_count, document in enumerate(documents, start=1):
+        document_chunks = chunk_documents(
+            [document],
+            chunk_size=chunk_size,
+            overlap=overlap,
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+        )
+        chunks.extend(document_chunks)
+        pending.extend(document_chunks)
+        while len(pending) >= batch_size:
+            encode_batch(pending[:batch_size])
+            del pending[:batch_size]
+        if on_progress and document_count % 250 == 0:
+            on_progress(document_count)
+    if pending:
+        encode_batch(pending)
+    if on_progress and document_count % 250:
+        on_progress(document_count)
+
+    vectors = np.concatenate(vector_batches) if vector_batches else np.empty((0, 0), dtype=np.float32)
+    return chunks, vectors
 
 
 def prepare_index(
@@ -61,14 +117,11 @@ def prepare_index(
     elif precomputed is None:
         if embedder is None:
             raise ValueError("An embedding model or precomputed vectors are required to build the index.")
-        documents = load_documents(dataset, knowledge_base)
-        chunks = chunk_documents(documents, chunk_size=chunk_size, overlap=overlap)
-        vectors = embedder.encode(
-            [chunk["text"] for chunk in chunks],
-            batch_size=64,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
+        chunks, vectors = embed_documents(
+            iter_documents(dataset, knowledge_base),
+            embedder,
+            chunk_size,
+            overlap,
         )
     else:
         chunks, vectors = precomputed
