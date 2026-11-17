@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 360" role="img" aria-labelledby="title desc">
+  <title id="title">Circuit de Monaco</title>
+  <desc id="desc">A clean illustrated map of a Formula One street circuit beside the Mediterranean.</desc>
+  <defs>
+    <linearGradient id="sea" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9eef2"/>
+      <stop offset="1" stop-color="#c8e4eb"/>
+    </linearGradient>
+    <linearGradient id="land" x2="1" y2="1">
+      <stop offset="0" stop-color="#f4f2e8"/>
+      <stop offset="1" stop-color="#e7e8dc"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#173247" flood-opacity=".16"/>
+    </filter>
+  </defs>
+  <rect width="900" height="360" rx="26" fill="url(#sea)"/>
+  <path d="M0 0h900v176c-58-16-86-38-147-32-75 8-101 38-167 26-72-13-104-39-164-32-70 8-102 42-166 38-62-4-106-27-152-14C63 176 34 200 0 205z" fill="url(#land)"/>
+  <path d="M36 36h148v92H36zM210 30h104v61H210zM342 40h116v89H342zM522 28h134v84H522zM696 29h152v101H696z" fill="#fff" opacity=".68"/>
+  <path d="M48 49h123M48 67h123M48 85h123M222 43h79M222 60h79M356 55h88M356 73h88M540 43h98M540 61h98M714 47h116M714 67h116M714 87h116" stroke="#cbd4d4" stroke-width="5" stroke-linecap="round"/>
+  <path d="M64 153c18-19 38-19 55-2s39 17 55 0 37-20 56-2 40 16 57-1 37-19 56-1 38 17 56-1 38-19 56-1 38 16 56-2 37-18 55-1 38 18 56 0 37-19 56-1 38 18 55 0" fill="none" stroke="#91ad8c" stroke-width="13" stroke-linecap="round" opacity=".72"/>
+  <path d="M115 285c12 0 17-10 17-24V204c0-16 8-23 24-23h111c19 0 26-8 26-26V120c0-17 9-26 27-26h112c17 0 26 8 26 24v42c0 16 8 24 24 24h92c17 0 25 8 25 24v30c0 16 8 24 25 24h82c17 0 25-8 25-24v-12c0-15 8-22 22-22h48c15 0 23 8 23 23v33c0 16-8 24-25 24h-79c-17 0-25 8-25 24v7c0 16-8 24-25 24h-77c-18 0-26-8-26-25v-7c0-17-9-25-26-25H352c-18 0-27 8-27 25v8c0 16-8 24-25 24H175c-17 0-25-8-25-24v-6c0-15-8-23-23-23h-12" fill="none" stroke="#9c1617" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" opacity=".16"/>
+  <path d="M115 285c12 0 17-10 17-24V204c0-16 8-23 24-23h111c19 0 26-8 26-26V120c0-17 9-26 27-26h112c17 0 26 8 26 24v42c0 16 8 24 24 24h92c17 0 25 8 25 24v30c0 16 8 24 25 24h82c17 0 25-8 25-24v-12c0-15 8-22 22-22h48c15 0 23 8 23 23v33c0 16-8 24-25 24h-79c-17 0-25 8-25 24v7c0 16-8 24-25 24h-77c-18 0-26-8-26-25v-7c0-17-9-25-26-25H352c-18 0-27 8-27 25v8c0 16-8 24-25 24H175c-17 0-25-8-25-24v-6c0-15-8-23-23-23h-12" fill="none" stroke="#fcfdff" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" filter="url(#shadow)"/>
+  <path d="M115 285c12 0 17-10 17-24V204c0-16 8-23 24-23h111c19 0 26-8 26-26V120c0-17 9-26 27-26h112" fill="none" stroke="#e10600" stroke-width="3" stroke-linecap="round" stroke-dasharray="3 8"/>
+  <path d="M120 276v18m10-18v18m10-18v18m10-18v18" stroke="#e10600" stroke-width="3"/>
+  <circle cx="115" cy="285" r="7" fill="#e10600" stroke="#fff" stroke-width="3"/>
+  <g fill="#427f68"><circle cx="220" cy="141" r="9"/><circle cx="240" cy="145" r="7"/><circle cx="497" cy="119" r="8"/><circle cx="515" cy="125" r="6"/><circle cx="620" cy="139" r="8"/><circle cx="644" cy="146" r="7"/></g>
+  <g fill="#fff" stroke="#e1e4dc" stroke-width="2"><path d="M710 154h28v18h-28zM751 145h24v21h-24zM793 154h29v18h-29z"/><path d="M338 162h26v18h-26zM373 164h22v16h-22z"/></g>
+  <g font-family="Arial,sans-serif" fill="#172033">
+    <text x="38" y="325" font-size="13" font-weight="700" letter-spacing="2.5">CIRCUIT DE MONACO</text>
+    <text x="38" y="344" font-size="9" fill="#596579" letter-spacing="1.5">MONTE-CARLO · MEDITERRANEAN COAST</text>
+    <text x="742" y="318" font-size="9" fill="#596579" letter-spacing="1.8">RACE DISTANCE</text>
+    <text x="742" y="338" font-size="15" font-weight="700">3.337 KM</text>
+  </g>
+</svg>

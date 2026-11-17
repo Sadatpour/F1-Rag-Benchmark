@@ -88,6 +88,8 @@ capabilities = ["chat", "json"]
 [routing]
 # Ordered fallback; only transient network, rate-limit, and server failures advance to the next model.
 answer_rotation = [
-    "groq::openai/gpt-oss-20b",
     "openrouter::openrouter/free",
+    "gemini::gemma-4-31b-it",
+    "openai::gpt-4o-mini",
+    "groq::openai/gpt-oss-20b",
 ]

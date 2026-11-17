@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+from http.client import HTTPException
 import json
 import logging
 import sys
@@ -15,6 +17,7 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env", override=False)
+TRACK_ARTWORK = base64.b64encode((ROOT / "assets" / "monaco-circuit.svg").read_bytes()).decode("ascii")
 LOGGER = logging.getLogger(__name__)
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -61,18 +64,52 @@ st.set_page_config(
 st.html(
     """
     <style>
-    .hero { border:1px solid #402529; border-radius:24px; padding:2rem 2.2rem; margin:.4rem 0 1.6rem; background:linear-gradient(112deg,rgba(239,68,68,.16),rgba(21,23,28,.76) 58%); }
-    .eyebrow { color:#f87171; text-transform:uppercase; letter-spacing:.18em; font-weight:700; font-size:.72rem; }
-    .hero-title { font-size:2.55rem; font-weight:700; margin:.3rem 0; letter-spacing:-.05em; }
-    .hero-copy { color:#b8bac2; max-width:760px; margin:0; }
+    :root { --apex-red:#e10600; --apex-ink:#172033; --apex-muted:#687386; --apex-line:#e5e9ef; --apex-panel:#fff; }
+    .stApp { background:#f4f6f9; color:var(--apex-ink); }
+    [data-testid="stHeader"] { background:rgba(244,246,249,.9); }
+    [data-testid="stSidebar"] { background:#fff; border-right:1px solid var(--apex-line); }
+    [data-testid="stSidebar"] > div:first-child { padding-top:1.35rem; }
+    [data-testid="stMainBlockContainer"] { max-width:1560px; padding-top:1.35rem; padding-bottom:3rem; }
+    .hero { position:relative; overflow:hidden; display:flex; justify-content:space-between; align-items:center; gap:2rem; min-height:190px; border:1px solid #e1e5eb; border-radius:22px; padding:2rem 2.4rem; margin:.15rem 0 1.1rem; background:linear-gradient(112deg,#fff 0%,#fff 68%,#fcebea 100%); box-shadow:0 12px 30px rgba(23,32,51,.055); }
+    .hero:before { content:""; position:absolute; inset:0 auto 0 0; width:8px; background:var(--apex-red); }
+    .hero:after { content:""; position:absolute; right:7%; bottom:-70px; width:39%; height:150px; transform:skewX(-32deg); border-top:2px solid rgba(225,6,0,.15); background:repeating-linear-gradient(90deg,transparent 0 28px,rgba(23,32,51,.035) 28px 30px); }
+    .hero-main { position:relative; z-index:1; max-width:760px; }
+    .eyebrow { color:#a00b08; text-transform:uppercase; letter-spacing:.16em; font-weight:800; font-size:.72rem; }
+    .hero-title { color:var(--apex-ink); font-size:clamp(2.25rem,4vw,3.2rem); line-height:1; font-weight:850; margin:.55rem 0 .7rem; letter-spacing:-.06em; }
+    .hero-title span { color:var(--apex-red); }
+    .hero-copy { color:#5b6575; max-width:690px; line-height:1.6; margin:0; }
+    .hero-track { position:relative; z-index:1; width:min(42%,400px); height:auto; border:1px solid #e1e7eb; border-radius:16px; box-shadow:0 10px 28px rgba(23,32,51,.1); }
+    [data-testid="stSidebar"] h2 { color:var(--apex-ink); font-weight:800; letter-spacing:-.03em; }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong { color:#344054; }
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color:#4d5869; font-weight:650; }
+    div[data-testid="stMetric"] { min-height:104px; background:var(--apex-panel); border:1px solid var(--apex-line); border-radius:16px; padding:1rem 1.1rem; box-shadow:0 4px 14px rgba(23,32,51,.035); }
+    div[data-testid="stMetricLabel"] { color:var(--apex-muted); font-size:.78rem; font-weight:650; }
+    div[data-testid="stMetricValue"] { color:var(--apex-ink); font-size:1.32rem; font-weight:800; }
+    .stTabs [data-baseweb="tab-list"] { display:flex; gap:.35rem; padding:.4rem; border:1px solid #e6e9ee; border-radius:14px; background:#e9edf2; }
+    .stTabs [data-baseweb="tab"] { min-height:2.7rem; border-radius:10px; padding:.55rem 1rem; color:#576174; font-weight:700; }
+    .stTabs [aria-selected="true"] { background:#fff; color:#a10e0a; box-shadow:0 2px 8px rgba(23,32,51,.1); }
+    .stTabs [data-baseweb="tab-highlight"] { background:var(--apex-red); }
+    .stTabs [data-baseweb="tab-border"] { display:none; }
+    .stButton > button, .stFormSubmitButton > button { min-height:2.75rem; border-radius:10px; font-weight:750; transition:transform .15s ease,box-shadow .15s ease; }
+    .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] { background:var(--apex-red); border-color:var(--apex-red); color:#fff; }
+    .stButton > button:hover, .stFormSubmitButton > button:hover { transform:translateY(-1px); box-shadow:0 7px 18px rgba(225,6,0,.16); }
+    div[data-testid="stVerticalBlockBorderWrapper"] { background:#fff; border-color:var(--apex-line); border-radius:15px; box-shadow:0 4px 14px rgba(23,32,51,.035); }
+    div[data-testid="stDataFrame"] { border:1px solid var(--apex-line); border-radius:14px; overflow:hidden; }
+    [data-testid="stExpander"] { background:#fff; border:1px solid var(--apex-line); border-radius:12px; }
+    [data-testid="stAlert"] { border-radius:12px; }
+    h1,h2,h3 { color:var(--apex-ink); letter-spacing:-.025em; }
+    p,li { line-height:1.58; }
+    @media (max-width:700px) { .hero { min-height:0; padding:1.4rem 1.3rem; flex-direction:column; align-items:flex-start; } .hero-track { width:100%; } .hero:after { width:75%; } [data-testid="stMainBlockContainer"] { padding-left:1rem; padding-right:1rem; } .stTabs [data-baseweb="tab-list"] { overflow-x:auto; } }
     </style>
     <div class="hero">
-      <div class="eyebrow">Formula 1 · Retrieval augmented generation</div>
-      <div class="hero-title">Apex RAG <span style="color:#ef4444">Knowledge Lab</span></div>
-      <p class="hero-copy">Compare knowledge sources, embeddings, vector stores, and answer models
-      using an independent, reproducible Formula 1 RAG benchmark.</p>
+      <div class="hero-main">
+        <div class="eyebrow">Formula 1 · Data engineering · AI</div>
+        <div class="hero-title">APEX <span>RAG</span> LAB</div>
+        <p class="hero-copy">Explore F1 knowledge, compare retrieval strategies, and measure answer quality in one focused workspace.</p>
+      </div>
+      <img class="hero-track" src="data:image/svg+xml;base64,__TRACK_ARTWORK__" alt="Illustrated Circuit de Monaco" />
     </div>
-    """,
+    """.replace("__TRACK_ARTWORK__", TRACK_ARTWORK),
 )
 
 
@@ -107,7 +144,7 @@ def embedding_signature() -> tuple[str, str, str, int, int]:
 def model_catalog() -> tuple[dict[str, dict[str, Any]], str | None]:
     try:
         return list_models(), None
-    except (RuntimeError, TimeoutError) as error:
+    except (RuntimeError, TimeoutError, HTTPException, OSError) as error:
         return {}, str(error)
 
 
@@ -414,18 +451,31 @@ model_options = list(
 )
 
 with st.sidebar:
-    st.markdown("## Apex RAG")
-    st.caption("F1 knowledge retrieval & model benchmark")
-    st.space("small")
+    st.markdown("## :material/speed: Apex RAG")
+    st.caption("F1 knowledge lab")
 
+    st.markdown("**Knowledge source**")
     dataset_title = st.selectbox("Knowledge source", ("Wikipedia", "Jolpica"), index=0)
     dataset = dataset_title.lower()
-    store_names = st.multiselect(
-        "Vector stores — compare",
-        ("NumPy (exact)", "FAISS", "ChromaDB", "BM25", "Hybrid (NumPy + BM25)"),
+    st.markdown("**Retrieval setup**")
+    vector_stores = st.multiselect(
+        "Vector databases",
+        ("NumPy (exact)", "FAISS", "ChromaDB"),
         default=["NumPy (exact)"],
-        help="FAISS and ChromaDB need the optional vector-store dependencies.",
+        help="These options store and search dense embedding vectors. FAISS and ChromaDB need optional dependencies.",
     )
+    retrieval_methods = st.multiselect(
+        "Retrieval methods",
+        ("Dense", "BM25", "Hybrid (NumPy + BM25)"),
+        default=["Dense"],
+        help="Dense uses the selected vector databases. BM25 searches words. Hybrid combines NumPy dense search with BM25 using RRF.",
+    )
+    store_names = list(vector_stores) if "Dense" in retrieval_methods else []
+    if "BM25" in retrieval_methods:
+        store_names.append("BM25")
+    if "Hybrid (NumPy + BM25)" in retrieval_methods:
+        store_names.append("Hybrid (NumPy + BM25)")
+    st.markdown("**Answer models**")
     selected_models = st.multiselect(
         "Answer models",
         model_options,
@@ -433,55 +483,49 @@ with st.sidebar:
         help="A model is queried once per selected vector store.",
         format_func=_model_label,
     )
-    judge_enabled = st.toggle(
-        "Use judge model",
-        value=True,
-        help="Turn this off to skip judge calls in answer comparisons and QA accuracy runs.",
-    )
-    judge_model = st.selectbox(
-        "Judge model",
-        model_options,
-        index=model_options.index(DEFAULT_JUDGE_MODEL) if DEFAULT_JUDGE_MODEL in model_options else 0,
-        disabled=not judge_enabled,
-        format_func=_model_label,
-    )
-    rewrite_enabled = st.toggle("Rewrite query before embedding", value=False)
-    rewrite_model = st.selectbox(
-        "Query-rewrite model",
-        model_options,
-        index=model_options.index(DEFAULT_REWRITE_MODEL) if DEFAULT_REWRITE_MODEL in model_options else 0,
-        disabled=not rewrite_enabled,
-        format_func=_model_label,
-    )
-    st.space("small")
-    chunk_size = st.select_slider(
-        "Chunk size (embedding tokens)",
-        options=(128, 192, 224),
-        value=192,
-        help="Tokenized with the embedding model tokenizer; each chunk stays within its 256-token input limit.",
-    )
-    overlap = st.select_slider(
-        "Chunk overlap (tokens)",
-        options=(0, 16, 32, 48),
-        value=32,
-    )
-    if overlap >= chunk_size:
-        st.error("Overlap must be smaller than the selected chunk size.")
     top_k = st.slider("Retrieved context count", min_value=1, max_value=10, value=5)
 
-    st.space("small")
-    st.markdown("**Model context windows**")
-    context_models = (
-        *selected_models,
-        *((judge_model,) if judge_enabled else ()),
-        *((rewrite_model,) if rewrite_enabled else ()),
-    )
-    for model in dict.fromkeys(context_models):
-        context = _context_window(model)
-        context_label = f"{int(context):,} tokens" if isinstance(context, (int, float)) else "not listed"
-        st.caption(f"`{model}` · {context_label}")
-    st.caption(f"Embedding: `{EMBEDDING_MODEL_ID}`")
-    st.caption(f"Local weights: `{EMBEDDING_WEIGHTS_PATH}`")
+    with st.expander("Advanced settings", expanded=False):
+        judge_enabled = st.toggle(
+            "Use judge model",
+            value=True,
+            help="Turn this off to skip judge calls in answer comparisons and QA accuracy runs.",
+        )
+        judge_model = st.selectbox(
+            "Judge model",
+            model_options,
+            index=model_options.index(DEFAULT_JUDGE_MODEL) if DEFAULT_JUDGE_MODEL in model_options else 0,
+            disabled=not judge_enabled,
+            format_func=_model_label,
+        )
+        rewrite_enabled = st.toggle("Rewrite query before embedding", value=False)
+        rewrite_model = st.selectbox(
+            "Query-rewrite model",
+            model_options,
+            index=model_options.index(DEFAULT_REWRITE_MODEL) if DEFAULT_REWRITE_MODEL in model_options else 0,
+            disabled=not rewrite_enabled,
+            format_func=_model_label,
+        )
+        chunk_size = st.select_slider(
+            "Chunk size (embedding tokens)",
+            options=(128, 192, 224),
+            value=192,
+            help="Tokenized with the embedding model tokenizer; each chunk stays within its 256-token input limit.",
+        )
+        overlap = st.select_slider("Chunk overlap (tokens)", options=(0, 16, 32, 48), value=32)
+        if overlap >= chunk_size:
+            st.error("Overlap must be smaller than the selected chunk size.")
+        st.markdown("**Model context windows**")
+        context_models = (
+            *selected_models,
+            *((judge_model,) if judge_enabled else ()),
+            *((rewrite_model,) if rewrite_enabled else ()),
+        )
+        for model in dict.fromkeys(context_models):
+            context = _context_window(model)
+            context_label = f"{int(context):,} tokens" if isinstance(context, (int, float)) else "not listed"
+            st.caption(f"`{model}` · {context_label}")
+        st.caption(f"Embedding: `{EMBEDDING_MODEL_ID}`")
     if api_key_error and _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))):
         st.error(api_key_error)
     elif not api_key and _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))):
@@ -508,34 +552,36 @@ except (OSError, KeyError, ValueError) as error:
     st.error(f"The knowledge-base manifest is invalid: {error}")
     st.stop()
 
-summary_columns = st.columns(4)
-for column, label, value in zip(
-    summary_columns,
-    ("Selected source", "Source documents", "Evaluation Q&A", "Chunk configuration"),
-    (dataset_title, f"{corpus_total:,}", f"{qa_total:,}", f"{chunk_size} / {overlap}"),
-):
-    column.metric(label, value, border=True)
-
 if dataset == "jolpica":
     st.info(
         f"Data source: [{JOLPICA_ATTRIBUTION}]({JOLPICA_API_BASE}/). "
         "Retrieved records link to their corresponding API endpoints."
     )
 
+work_column, metrics_rail = st.columns([4.2, 1], gap="large", vertical_alignment="top")
+with work_column:
+    st.subheader(":material/travel_explore: Ask the F1 knowledge base")
+    st.caption("Ask once, then compare how each retrieval setup supports the answer with evidence.")
+    with st.form("query_form", clear_on_submit=False, border=True):
+        question = st.text_area(
+            "Question",
+            placeholder="Who won the 1976 Formula One World Championship?",
+            height=90,
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button("Retrieve & compare", type="primary", width="stretch")
+with metrics_rail:
+    st.markdown("**SESSION SNAPSHOT**")
+    st.metric("Selected source", dataset_title, border=True)
+    st.metric("Source documents", f"{corpus_total:,}", border=True)
+    st.metric("Evaluation Q&A", f"{qa_total:,}", border=True)
+    st.metric("Chunk / overlap", f"{chunk_size} / {overlap}", border=True)
+
 query_tab, eval_tab, experiments_tab, about_tab = st.tabs(
     (":material/search: Compare answers", ":material/query_stats: Evaluation", ":material/tune: Experiments", ":material/folder: Project guide")
 )
 
 with query_tab:
-    st.subheader("Ask the F1 knowledge base")
-    with st.form("query_form", clear_on_submit=False):
-        question = st.text_area(
-            "Question",
-            placeholder="Who won the 1976 Formula One World Championship?",
-            height=90,
-        )
-        submitted = st.form_submit_button("Retrieve & compare", type="primary", width="stretch")
-
     if submitted:
         if not question.strip():
             st.error("Enter a question before running the comparison.")
@@ -691,7 +737,7 @@ with query_tab:
                                     st.divider()
 
 with eval_tab:
-    st.subheader("Retrieval & answer evaluation")
+    st.subheader(":material/query_stats: Retrieval & answer evaluation")
     st.caption(
         "Reference-source hit@10 and source-level NDCG@10 use the single source label on each QA row; "
         "they are not document/chunk recall. QA accuracy is a stratified sample estimate, not a corpus-wide score."
@@ -744,7 +790,7 @@ with eval_tab:
         "and calibrate them with human review."
     )
     accuracy_model = st.selectbox("Model to evaluate", selected_models or model_options, key="accuracy_model", format_func=_model_label)
-    accuracy_store = st.selectbox("Vector store to evaluate", store_names or ("NumPy (exact)",), key="accuracy_store")
+    accuracy_store = st.selectbox("Retrieval option to evaluate", store_names or ("NumPy (exact)",), key="accuracy_store")
     accuracy_button = st.button(
         "Evaluate answers with judge",
         disabled=not judge_enabled or (_requires_openrouter_key((accuracy_model, judge_model)) and not api_key) or not store_names or not selected_models,
@@ -800,7 +846,7 @@ with eval_tab:
                 )
 
 with experiments_tab:
-    st.subheader("Controlled retrieval experiments")
+    st.subheader(":material/tune: Controlled retrieval experiments")
     st.caption(
         "The tuning grid uses a deterministic tuning split. The separate holdout action runs the selected configuration once. "
         "The current QA labels identify a source, so retrieval scores are source-level until complete qrels are added."
@@ -981,7 +1027,7 @@ with experiments_tab:
             second_metrics[3].metric("Search CPU", _format_seconds(result["search_cpu_seconds_median"]))
 
 with about_tab:
-    st.subheader("Project map")
+    st.subheader(":material/route: Project map")
     st.markdown(
         """
         - `knowledge_base/corpora/` — Independent, ready-to-use Wikipedia and Jolpica corpora
