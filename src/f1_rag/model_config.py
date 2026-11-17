@@ -44,6 +44,32 @@ def load_model_config(path: Path = MODEL_CONFIG_PATH) -> dict[str, Any]:
         for model, size in windows.items()
     ):
         raise ValueError(f"{path} context_windows must map model IDs to positive token counts.")
+
+    providers = config.get("providers", {})
+    models = config.get("models", {})
+    routing = config.get("routing", {})
+    if not isinstance(providers, dict) or not isinstance(models, dict) or not isinstance(routing, dict):
+        raise ValueError(f"{path} providers, models, and routing must be TOML tables.")
+    for provider, settings in providers.items():
+        if not isinstance(settings, dict):
+            raise ValueError(f"{path} providers.{provider} must be a TOML table.")
+        if settings.get("protocol") not in {"openai_chat", "google_generate_content"}:
+            raise ValueError(f"{path} providers.{provider}.protocol is unsupported.")
+        if not str(settings.get("base_url", "")).startswith("https://"):
+            raise ValueError(f"{path} providers.{provider}.base_url must use HTTPS.")
+        if not isinstance(settings.get("api_key_env"), str) or not settings["api_key_env"].strip():
+            raise ValueError(f"{path} providers.{provider}.api_key_env must name an environment variable.")
+    for name, settings in models.items():
+        if not isinstance(settings, dict) or settings.get("provider") not in providers:
+            raise ValueError(f"{path} models.{name} must reference a configured provider.")
+        if not isinstance(settings.get("model_id"), str) or not settings["model_id"].strip():
+            raise ValueError(f"{path} models.{name}.model_id must be a non-empty string.")
+        capabilities = settings.get("capabilities")
+        if not isinstance(capabilities, list) or not capabilities or any(not isinstance(value, str) for value in capabilities):
+            raise ValueError(f"{path} models.{name}.capabilities must be a non-empty string array.")
+    rotation = routing.get("answer_rotation", [])
+    if not isinstance(rotation, list) or any(name not in models for name in rotation):
+        raise ValueError(f"{path} routing.answer_rotation must contain configured model names.")
     return config
 
 

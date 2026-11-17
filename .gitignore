@@ -17,15 +17,13 @@ dist/
 .env
 .env.*
 !.env.example
-.streamlit/secrets.toml
-secrets/*.toml
-!secrets/*.example.toml
 
 # Downloaded weights, caches and generated vector indexes
 models/embedding/*
 !models/embedding/.gitkeep
 *.safetensors
 knowledge_base/indices/
+knowledge_base/runs/
 knowledge_base/corpora/jolpica.jsonl
 .cache/
 

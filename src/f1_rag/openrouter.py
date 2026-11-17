@@ -3,17 +3,21 @@ from __future__ import annotations
 import json
 import os
 import re
-import tomllib
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from f1_rag.model_config import load_model_config
+from f1_rag.providers import ProviderRouter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 MODEL_CONFIG = load_model_config()
+PROVIDER_ROUTER = ProviderRouter(
+    MODEL_CONFIG,
+    PROJECT_ROOT / "knowledge_base" / "runs" / "provider-calls.jsonl",
+)
 OPENROUTER_CONFIG = MODEL_CONFIG["openrouter"]
 DEFAULT_MODELS = tuple(OPENROUTER_CONFIG["answer_models"])
 DEFAULT_JUDGE_MODEL = OPENROUTER_CONFIG["judge_model"]
@@ -26,17 +30,10 @@ CONTEXT_TOKEN_SAFETY_MARGIN = 256
 
 
 def get_api_key() -> str:
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if key:
-        return key
-    secrets_file = PROJECT_ROOT / ".streamlit" / "secrets.toml"
-    if not secrets_file.is_file():
-        return ""
-    try:
-        settings = tomllib.loads(secrets_file.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise ValueError(f"Could not read {secrets_file}: {error}") from error
-    return str(settings.get("openrouter", {}).get("api_key", "")).strip()
+    return os.environ.get("OPENROUTER_API_KEY", "").strip()
+
+
+PROVIDER_ROUTER.key_resolvers["openrouter"] = get_api_key
 
 
 def _request(
@@ -90,9 +87,27 @@ def chat_completion(
     response_format: dict[str, str] | None = None,
     reasoning: dict[str, str] | None = None,
 ) -> str:
+    if model == "rotation::answer":
+        result = PROVIDER_ROUTER.rotate(
+            MODEL_CONFIG.get("routing", {}).get("answer_rotation", []),
+            messages,
+            capability="json" if response_format else "chat",
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return result.text
+    if "::" in model:
+        result = PROVIDER_ROUTER.complete(
+            model,
+            messages,
+            capability="json" if response_format else "chat",
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return result.text
     if not api_key:
         raise ValueError(
-            "OpenRouter API key not found. Set OPENROUTER_API_KEY or add it to .streamlit/secrets.toml."
+            "OpenRouter API key not found. Set OPENROUTER_API_KEY in the environment or project .env file."
         )
     payload: dict[str, Any] = {
         "model": model,

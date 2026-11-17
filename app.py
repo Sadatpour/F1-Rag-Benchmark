@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sys
@@ -8,9 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+import pandas as pd
+from dotenv import load_dotenv
 
 
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env", override=False)
 LOGGER = logging.getLogger(__name__)
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -21,6 +25,7 @@ from f1_rag.embeddings import (
     load_embedding_model,
 )
 from f1_rag.evaluation import ndcg_at_n, qa_accuracy, recall_at_n, stratified_sample
+from f1_rag.benchmark import BenchmarkConfig, benchmark_store, run_hyperparameter_grid
 from f1_rag.ingest import KNOWLEDGE_BASE, iter_documents, resolve_corpus_path
 from f1_rag.openrouter import (
     ADDITIONAL_MODELS,
@@ -28,6 +33,7 @@ from f1_rag.openrouter import (
     DEFAULT_JUDGE_MODEL,
     DEFAULT_MODELS,
     DEFAULT_REWRITE_MODEL,
+    PROVIDER_ROUTER,
     answer_question,
     get_api_key,
     judge_answer,
@@ -42,6 +48,7 @@ from f1_rag.sources import (
     jolpica_source_url,
     wikipedia_source_url,
 )
+from f1_rag.sparse import BM25Index, hybrid_search
 
 
 st.set_page_config(
@@ -202,6 +209,19 @@ def _dataset_questions(dataset: str) -> list[dict[str, Any]]:
     return [row for row in candidates if row.get("source") in sources]
 
 
+def _evaluation_split(rows: list[dict[str, Any]], split: str) -> list[dict[str, Any]]:
+    """Create a deterministic 80/20 tuning and holdout split from question text."""
+    if split not in {"tune", "test"}:
+        raise ValueError("split must be 'tune' or 'test'.")
+    selected = []
+    for row in rows:
+        key = f"{row.get('source', '')}\0{row.get('question', '')}".encode("utf-8")
+        is_test = int(hashlib.sha256(key).hexdigest()[:8], 16) % 5 == 0
+        if is_test == (split == "test"):
+            selected.append(row)
+    return selected
+
+
 @st.cache_data(show_spinner=False, max_entries=2)
 def _corpus_sources(dataset: str) -> set[str]:
     path = resolve_corpus_path(dataset)
@@ -230,6 +250,36 @@ def _ready_index(dataset: str, store_name: str, chunk_size: int, overlap: int) -
     )
 
 
+@st.cache_resource(show_spinner=False, max_entries=4)
+def sparse_index(
+    dataset: str,
+    model_id: str,
+    model_path: str,
+    weights_path: str,
+    weights_size: int,
+    weights_mtime: int,
+    chunk_size: int,
+    overlap: int,
+    corpus_size: int,
+    corpus_mtime: int,
+    corpus_document_count: int,
+) -> BM25Index:
+    chunks, _ = embedded_corpus(
+        dataset,
+        model_id,
+        model_path,
+        weights_path,
+        weights_size,
+        weights_mtime,
+        chunk_size,
+        overlap,
+        corpus_size,
+        corpus_mtime,
+        corpus_document_count,
+    )
+    return BM25Index(chunks)
+
+
 def _get_hits(
     dataset: str,
     store_name: str,
@@ -237,7 +287,27 @@ def _get_hits(
     overlap: int,
     query_vector: Any,
     count: int,
+    query_text: str = "",
 ) -> tuple[list[dict[str, Any]], int]:
+    if store_name in {"BM25", "Hybrid (NumPy + BM25)"}:
+        corpus_path = resolve_corpus_path(dataset)
+        corpus_stat = corpus_path.stat()
+        sparse = sparse_index(
+            dataset,
+            *embedding_signature(),
+            chunk_size,
+            overlap,
+            corpus_stat.st_size,
+            corpus_stat.st_mtime_ns,
+            corpus_total,
+        )
+        candidate_count = min(max(count * 3, count), len(sparse.documents))
+        sparse_hits = sparse.search(query_text, candidate_count)
+        if store_name == "BM25":
+            return sparse_hits, len(sparse.documents)
+        dense_store, _, _ = _ready_index(dataset, "NumPy (exact)", chunk_size, overlap)
+        dense_hits = dense_store.search(query_vector, candidate_count)
+        return hybrid_search(dense_hits, sparse_hits, count), len(sparse.documents)
     store, chunk_count, _ = _ready_index(dataset, store_name, chunk_size, overlap)
     return store.search(query_vector, count), chunk_count
 
@@ -254,7 +324,7 @@ def _run_retrieval_evaluation(
     ndcgs = []
     for row in rows:
         query = encode_query(embedder, str(row["question"]))
-        hits, _ = _get_hits(dataset, store_name, chunk_size, overlap, query, 10)
+        hits, _ = _get_hits(dataset, store_name, chunk_size, overlap, query, 10, str(row["question"]))
         relevant = {str(row["source"])} if row.get("source") else set()
         recalls.append(recall_at_n(hits, relevant, 10))
         ndcgs.append(ndcg_at_n(hits, relevant, 10))
@@ -268,6 +338,35 @@ def _run_retrieval_evaluation(
 def _context_window(model: str) -> int | None:
     value = model_info.get(model, {}).get("context_length") or CONTEXT_WINDOW_OVERRIDES.get(model)
     return int(value) if isinstance(value, (int, float)) else None
+
+
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "not measured"
+    sign = "−" if value < 0 else "+"
+    size = abs(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{sign}{size:.1f} {unit}"
+        size /= 1024
+    return f"{sign}{size:.1f} GB"
+
+
+def _format_seconds(value: float | None) -> str:
+    return "not measured" if value is None else f"{value:.3f} s"
+
+
+def _requires_openrouter_key(models: list[str] | tuple[str, ...]) -> bool:
+    return any("::" not in model or model.startswith("openrouter::") for model in models)
+
+
+def _model_label(model_name: str) -> str:
+    if model_name == "rotation::answer":
+        return "Provider rotation · configured order"
+    configured = PROVIDER_ROUTER.models.get(model_name)
+    if configured:
+        return f"{configured.provider} · {configured.model_id}"
+    return model_name
 
 
 def _render_source_citations(hits: list[dict[str, Any]]) -> None:
@@ -308,6 +407,8 @@ model_options = list(
             DEFAULT_REWRITE_MODEL,
             *ADDITIONAL_MODELS,
             *sorted(model_info),
+            *PROVIDER_ROUTER.models.keys(),
+            "rotation::answer",
         )
     )
 )
@@ -321,15 +422,16 @@ with st.sidebar:
     dataset = dataset_title.lower()
     store_names = st.multiselect(
         "Vector stores — compare",
-        ("NumPy (exact)", "FAISS", "ChromaDB"),
+        ("NumPy (exact)", "FAISS", "ChromaDB", "BM25", "Hybrid (NumPy + BM25)"),
         default=["NumPy (exact)"],
         help="FAISS and ChromaDB need the optional vector-store dependencies.",
     )
     selected_models = st.multiselect(
         "Answer models",
         model_options,
-        default=[model for model in DEFAULT_MODELS[:2] if model in model_options],
+        default=["rotation::answer"] if "rotation::answer" in model_options else [],
         help="A model is queried once per selected vector store.",
+        format_func=_model_label,
     )
     judge_enabled = st.toggle(
         "Use judge model",
@@ -341,6 +443,7 @@ with st.sidebar:
         model_options,
         index=model_options.index(DEFAULT_JUDGE_MODEL) if DEFAULT_JUDGE_MODEL in model_options else 0,
         disabled=not judge_enabled,
+        format_func=_model_label,
     )
     rewrite_enabled = st.toggle("Rewrite query before embedding", value=False)
     rewrite_model = st.selectbox(
@@ -348,6 +451,7 @@ with st.sidebar:
         model_options,
         index=model_options.index(DEFAULT_REWRITE_MODEL) if DEFAULT_REWRITE_MODEL in model_options else 0,
         disabled=not rewrite_enabled,
+        format_func=_model_label,
     )
     st.space("small")
     chunk_size = st.select_slider(
@@ -378,10 +482,12 @@ with st.sidebar:
         st.caption(f"`{model}` · {context_label}")
     st.caption(f"Embedding: `{EMBEDDING_MODEL_ID}`")
     st.caption(f"Local weights: `{EMBEDDING_WEIGHTS_PATH}`")
-    if api_key_error:
+    if api_key_error and _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))):
         st.error(api_key_error)
+    elif not api_key and _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))):
+        st.warning("Set `OPENROUTER_API_KEY` in the environment or project `.env` file.")
     elif not api_key:
-        st.warning("Add an OpenRouter key in `.streamlit/secrets.toml` or set `OPENROUTER_API_KEY`.")
+        st.caption("Direct provider keys are read from their matching environment variables.")
     if catalog_error:
         st.caption(f"Live model catalog unavailable; showing configured defaults. {catalog_error}")
 
@@ -416,8 +522,8 @@ if dataset == "jolpica":
         "Retrieved records link to their corresponding API endpoints."
     )
 
-query_tab, eval_tab, about_tab = st.tabs(
-    (":material/search: Compare answers", ":material/query_stats: Evaluation", ":material/folder: Project guide")
+query_tab, eval_tab, experiments_tab, about_tab = st.tabs(
+    (":material/search: Compare answers", ":material/query_stats: Evaluation", ":material/tune: Experiments", ":material/folder: Project guide")
 )
 
 with query_tab:
@@ -439,8 +545,8 @@ with query_tab:
             st.error("Select at least one answer model.")
         elif overlap >= chunk_size:
             st.error("Chunk overlap must be smaller than chunk size.")
-        elif not api_key:
-            st.error("Configure an OpenRouter API key before asking models to answer.")
+        elif _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))) and not api_key:
+            st.error("Configure the OpenRouter key for the selected model or auxiliary model.")
         else:
             payload: dict[str, Any] = {
                 "question": question.strip(),
@@ -478,6 +584,7 @@ with query_tab:
                                 overlap,
                                 query_vector,
                                 top_k,
+                                payload["query"],
                             )
                         payload["hits"][store_name] = hits
                         payload["chunks"][store_name] = count
@@ -636,11 +743,11 @@ with eval_tab:
         "Questions are sampled across entity types. Treat judge results as an estimate for this sample "
         "and calibrate them with human review."
     )
-    accuracy_model = st.selectbox("Model to evaluate", selected_models or model_options, key="accuracy_model")
+    accuracy_model = st.selectbox("Model to evaluate", selected_models or model_options, key="accuracy_model", format_func=_model_label)
     accuracy_store = st.selectbox("Vector store to evaluate", store_names or ("NumPy (exact)",), key="accuracy_store")
     accuracy_button = st.button(
         "Evaluate answers with judge",
-        disabled=not judge_enabled or not api_key or not store_names or not selected_models,
+        disabled=not judge_enabled or (_requires_openrouter_key((accuracy_model, judge_model)) and not api_key) or not store_names or not selected_models,
     )
     if accuracy_button:
         if not eval_pool:
@@ -660,6 +767,7 @@ with eval_tab:
                         overlap,
                         query_vector,
                         top_k,
+                        str(row["question"]),
                     )
                     generated = answer_question(
                         str(row["question"]),
@@ -691,6 +799,187 @@ with eval_tab:
                     f"{verdict['reason']}"
                 )
 
+with experiments_tab:
+    st.subheader("Controlled retrieval experiments")
+    st.caption(
+        "The tuning grid uses a deterministic tuning split. The separate holdout action runs the selected configuration once. "
+        "The current QA labels identify a source, so retrieval scores are source-level until complete qrels are added."
+    )
+    experiment_rows = _dataset_questions(dataset)
+    tuning_rows = _evaluation_split(experiment_rows, "tune")
+    holdout_rows = _evaluation_split(experiment_rows, "test")
+    vector_store_options = ("NumPy (exact)", "FAISS", "ChromaDB")
+    experiment_stores = st.multiselect(
+        "Vector stores to compare",
+        vector_store_options,
+        default=["NumPy (exact)"],
+        key="experiment_stores",
+    )
+    experiment_sizes = st.multiselect(
+        "Chunk sizes (embedding tokens)", (128, 192, 224), default=[128, 192, 224], key="experiment_chunk_sizes"
+    )
+    experiment_overlaps = st.multiselect(
+        "Overlap (tokens)", (0, 16, 32, 48), default=[0, 16, 32], key="experiment_overlaps"
+    )
+    experiment_top_ks = st.multiselect(
+        "Retrieved chunk counts", (3, 5, 8, 10), default=[3, 5, 8], key="experiment_top_ks"
+    )
+    experiment_repeats = st.slider("Index and query repetitions", 3, 10, 5, key="experiment_repeats")
+    experiment_sample_size = st.slider(
+        "Tuning Q&A sample", 10, 100, 30, step=10, key="experiment_sample_size"
+    )
+    if st.button("Run tuning grid", type="primary", disabled=not experiment_stores or not tuning_rows):
+        tuning_sample = stratified_sample(
+            tuning_rows, min(experiment_sample_size, len(tuning_rows)), seed=20261117
+        )
+        corpus_path = resolve_corpus_path(dataset)
+        corpus_stat = corpus_path.stat()
+
+        def prepare_experiment(chunk_size: int, overlap: int) -> tuple[list[dict[str, Any]], Any, Any]:
+            chunks, vectors = embedded_corpus(
+                dataset,
+                *embedding_signature(),
+                chunk_size,
+                overlap,
+                corpus_stat.st_size,
+                corpus_stat.st_mtime_ns,
+                corpus_total,
+            )
+            query_embedder = embedding_model(*embedding_signature())
+            return chunks, vectors, lambda text: encode_query(query_embedder, text)
+
+        with st.spinner("Building and measuring the selected configurations…"):
+            try:
+                grid_results = run_hyperparameter_grid(
+                    dataset=dataset,
+                    store_names=experiment_stores,
+                    embedding_model=EMBEDDING_MODEL_ID,
+                    chunk_sizes=experiment_sizes,
+                    overlaps=experiment_overlaps,
+                    top_ks=experiment_top_ks,
+                    repeats=experiment_repeats,
+                    prepare=prepare_experiment,
+                    queries=tuning_sample,
+                    output_dir=KNOWLEDGE_BASE / "runs",
+                )
+                st.session_state["tuning_results"] = grid_results
+            except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                st.error(f"The tuning experiment failed: {error}")
+
+    grid_results = st.session_state.get("tuning_results", [])
+    if grid_results:
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Run": item["run_id"],
+                    "Store": item["config"]["store_name"],
+                    "Chunk": item["config"]["chunk_size"],
+                    "Overlap": item["config"]["overlap"],
+                    "Top K": item["config"]["top_k"],
+                    "Build seconds": item["results"]["index_build_seconds_median"],
+                    "Search p50 ms": item["results"]["search_latency_ms_p50"],
+                    "Search p95 ms": item["results"]["search_latency_ms_p95"],
+                    "RAM delta bytes": item["results"]["rss_delta_bytes_median"],
+                    "Build CPU seconds": item["results"]["index_build_cpu_seconds_median"],
+                    "Search CPU seconds": item["results"]["search_cpu_seconds_median"],
+                    "Recall@K": item["results"]["recall_at_k"],
+                    "NDCG@K": item["results"]["ndcg_at_k"],
+                    "Error": item["error"],
+                }
+                for item in grid_results
+            ]),
+            alt="Comparison of vector store benchmark runs across configuration, latency, resource use, and retrieval quality",
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption("Each result is appended to knowledge_base/runs/runs.jsonl with its config and environment metadata.")
+
+    st.markdown("#### One-time holdout run")
+    test_store = st.selectbox("Vector store", vector_store_options, key="holdout_store")
+    test_chunk_size = st.selectbox("Chunk size", (128, 192, 224), index=1, key="holdout_chunk_size")
+    test_overlap = st.selectbox("Overlap", (0, 16, 32, 48), index=2, key="holdout_overlap")
+    test_top_k = st.selectbox("Top K", (3, 5, 8, 10), index=1, key="holdout_top_k")
+    holdout_settings = {
+        "dataset": dataset,
+        "store_name": test_store,
+        "embedding_model": EMBEDDING_MODEL_ID,
+        "chunk_size": test_chunk_size,
+        "overlap": test_overlap,
+        "top_k": test_top_k,
+        "repeats": 1,
+        "evaluation_split": "holdout",
+    }
+    run_log = KNOWLEDGE_BASE / "runs" / "runs.jsonl"
+    prior_holdout = False
+    if run_log.is_file():
+        try:
+            for line in run_log.read_text(encoding="utf-8").splitlines():
+                saved_run = json.loads(line)
+                if (
+                    saved_run.get("config", {}).get("dataset") == dataset
+                    and saved_run.get("config", {}).get("evaluation_split") == "holdout"
+                    and saved_run.get("error") is None
+                ):
+                    prior_holdout = True
+                    break
+        except (OSError, json.JSONDecodeError):
+            st.warning("Could not read the experiment history; holdout protection is unavailable.")
+    if prior_holdout:
+        st.info("This dataset already has a successful holdout result in the experiment log.")
+    if st.button("Run selected config on holdout once", disabled=not holdout_rows or prior_holdout):
+        test_sample = stratified_sample(holdout_rows, len(holdout_rows), seed=20261118)
+        corpus_path = resolve_corpus_path(dataset)
+        corpus_stat = corpus_path.stat()
+        with st.spinner("Preparing selected holdout configuration…"):
+            try:
+                chunks, vectors = embedded_corpus(
+                    dataset,
+                    *embedding_signature(),
+                    test_chunk_size,
+                    test_overlap,
+                    corpus_stat.st_size,
+                    corpus_stat.st_mtime_ns,
+                    corpus_total,
+                )
+                query_embedder = embedding_model(*embedding_signature())
+                holdout_result = benchmark_store(
+                    BenchmarkConfig(
+                        dataset,
+                        test_store,
+                        EMBEDDING_MODEL_ID,
+                        test_chunk_size,
+                        test_overlap,
+                        test_top_k,
+                        repeats=1,
+                        evaluation_split="holdout",
+                    ),
+                    chunks,
+                    vectors,
+                    test_sample,
+                    lambda text: encode_query(query_embedder, text),
+                    KNOWLEDGE_BASE / "runs",
+                )
+                st.session_state["holdout_result"] = holdout_result
+            except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                st.error(f"The holdout run failed: {error}")
+    holdout_result = st.session_state.get("holdout_result")
+    if holdout_result:
+        if holdout_result["error"]:
+            st.error(holdout_result["error"])
+        else:
+            result = holdout_result["results"]
+            st.success(f"Holdout run {holdout_result['run_id']} · {result['queries']} questions")
+            first_metrics = st.columns(4)
+            first_metrics[0].metric("Recall@K", f"{result['recall_at_k']:.3f}")
+            first_metrics[1].metric("NDCG@K", f"{result['ndcg_at_k']:.3f}")
+            first_metrics[2].metric("Search p50", f"{result['search_latency_ms_p50']:.2f} ms")
+            first_metrics[3].metric("Search p95", f"{result['search_latency_ms_p95']:.2f} ms")
+            second_metrics = st.columns(4)
+            second_metrics[0].metric("Index build", f"{result['index_build_seconds_median']:.2f} s")
+            second_metrics[1].metric("RAM delta", _format_bytes(result["rss_delta_bytes_median"]))
+            second_metrics[2].metric("Build CPU", _format_seconds(result["index_build_cpu_seconds_median"]))
+            second_metrics[3].metric("Search CPU", _format_seconds(result["search_cpu_seconds_median"]))
+
 with about_tab:
     st.subheader("Project map")
     st.markdown(
@@ -701,7 +990,7 @@ with about_tab:
         - `models/embedding/` — Downloaded Hugging Face embedding model
         - `models/llm/` — OpenRouter-hosted models; model weights are not stored locally
         - `config/models.toml` — Answer, judge, and rewrite model IDs; embedding model paths
-        - `.streamlit/secrets.toml` — Private OpenRouter key; never commit this file
+        - `.env` — Provider API keys; excluded from Git
         - `src/f1_rag/` — Ingestion, chunking, embeddings, vector stores, retrieval, generation, and evaluation
 
         The third vector-store option is **NumPy exact cosine**: Windows-friendly and service-free.

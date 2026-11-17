@@ -122,6 +122,14 @@ class ChromaStore:
             ) from error
         self.client = chromadb.PersistentClient(path=str(self.path))
 
+    def close(self) -> None:
+        if self.client is not None:
+            close = getattr(self.client, "close", None)
+            if callable(close):
+                close()
+            self.client = None
+            self.collection = None
+
     def load(self, fingerprint: str) -> bool:
         self._connect()
         manifest_path = self.path / "f1-rag-manifest.json"
@@ -169,12 +177,13 @@ class ChromaStore:
             include=["documents", "metadatas", "distances"],
         )
         hits: list[dict[str, Any]] = []
-        for text, metadata, distance in zip(
+        for document_id, text, metadata, distance in zip(
+            result["ids"][0],
             result["documents"][0],
             result["metadatas"][0],
             result["distances"][0],
         ):
-            hits.append({**metadata, "text": text, "score": 1.0 - float(distance)})
+            hits.append({**metadata, "id": document_id, "text": text, "score": 1.0 - float(distance)})
         return hits
 
 

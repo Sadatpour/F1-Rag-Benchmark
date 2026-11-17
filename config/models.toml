@@ -14,3 +14,80 @@ additional_models = []
 
 [context_windows]
 # Optionally pin or override context lengths (tokens) when OpenRouter has no catalog value.
+
+[providers.openrouter]
+protocol = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.openai]
+protocol = "openai_chat"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.xai]
+protocol = "openai_chat"
+base_url = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"
+
+[providers.mistral]
+protocol = "openai_chat"
+base_url = "https://api.mistral.ai/v1"
+api_key_env = "MISTRAL_API_KEY"
+
+[providers.google]
+protocol = "google_generate_content"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GOOGLE_API_KEY"
+
+[providers.groq]
+protocol = "openai_chat"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+
+[models."openai::gpt-4o-mini"]
+provider = "openai"
+model_id = "gpt-4o-mini"
+capabilities = ["chat", "json"]
+
+[models."grok::grok-4.6"]
+provider = "xai"
+model_id = "grok-4.6"
+capabilities = ["chat", "json"]
+
+[models."mistral::mistral-small-2603"]
+provider = "mistral"
+model_id = "mistral-small-2603"
+capabilities = ["chat", "json"]
+
+[models."gemini::gemma-4-31b-it"]
+provider = "google"
+model_id = "gemma-4-31b-it"
+capabilities = ["chat", "json"]
+
+[models."openrouter::google/gemma-4-31b-it"]
+provider = "openrouter"
+model_id = "google/gemma-4-31b-it"
+capabilities = ["chat", "json"]
+
+[models."groq::openai/gpt-oss-20b"]
+provider = "groq"
+model_id = "openai/gpt-oss-20b"
+capabilities = ["chat", "json", "tool_calling"]
+
+[models."groq::openai/gpt-oss-120b"]
+provider = "groq"
+model_id = "openai/gpt-oss-120b"
+capabilities = ["chat", "json", "tool_calling"]
+
+[models."openrouter::openrouter/free"]
+provider = "openrouter"
+model_id = "openrouter/free"
+capabilities = ["chat", "json"]
+
+[routing]
+# Ordered fallback; only transient network, rate-limit, and server failures advance to the next model.
+answer_rotation = [
+    "groq::openai/gpt-oss-20b",
+    "openrouter::openrouter/free",
+]

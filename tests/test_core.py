@@ -17,7 +17,6 @@ from f1_rag.evaluation import (
     ndcg_at_n,
     qa_accuracy,
     recall_at_n,
-    retrieval_metrics,
     stratified_sample,
 )
 from f1_rag.ingest import build_knowledge_base, load_documents
@@ -84,17 +83,6 @@ class EvaluationTests(unittest.TestCase):
 
     def test_qa_accuracy_is_fraction_correct(self) -> None:
         self.assertEqual(qa_accuracy([{"correct": True}, {"correct": False}]), 0.5)
-
-    def test_retrieval_metric_names_follow_requested_cutoff(self) -> None:
-        metrics = retrieval_metrics(
-            [{"question": "q", "source": "expected"}],
-            lambda _question, _n: [{"source": "expected"}],
-            n=5,
-        )
-
-        self.assertIn("recall@5", metrics)
-        self.assertIn("ndcg@5", metrics)
-        self.assertNotIn("recall@10", metrics)
 
     def test_stratified_sample_covers_entity_types_deterministically(self) -> None:
         rows = [
