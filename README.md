@@ -16,7 +16,6 @@ knowledge_base/
 models/
   embedding/all-MiniLM-L6-v2/       # Downloaded local embedding model (ignored by Git)
   llm/                              # OpenRouter-hosted models; no local weights
-.streamlit/secrets.toml             # Private OpenRouter key (never commit)
 ```
 
 The original `data/` and `pipeline/` folders were used only to prepare the independent knowledge base. They have been removed from this workspace; the dashboard does not need them.
@@ -35,15 +34,15 @@ python -m pip install -r requirements-embedding.txt
 
 The generated corpora and evaluation set are already bundled in `knowledge_base/`. To rebuild them, first restore the original `data/raw/wikipedia`, `data/raw/jolpica`, and `data/final/qa.jsonl` inputs, then run `python -m f1_rag.ingest`.
 
-### OpenRouter API key
+### Provider API keys
 
-Copy the example secrets file and add your key locally:
+Copy `.env.example` to `.env` and set only the keys for providers you use. The app loads `.env` without replacing environment variables that are already set:
 
 ```powershell
-Copy-Item .streamlit\secrets.toml.example .streamlit\secrets.toml
+Copy-Item .env.example .env
 ```
 
-Set the key under `[openrouter]`. Alternatively, define `OPENROUTER_API_KEY` in your environment. Both options are excluded from Git.
+Supported keys include `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `MISTRAL_API_KEY`, and `GOOGLE_API_KEY`. Provider, model ID, endpoint, protocol, and capabilities are separate in `config/models.toml`. Groq provides `openai/gpt-oss-20b` and `openai/gpt-oss-120b`; free-tier limits and model access can change. Provider usage limits are not a promise of zero-cost service. Never place key values in `config/models.toml`.
 
 The answer model defaults to `cohere/north-mini-code:free`; the free judge defaults to `nvidia/nemotron-3.5-lightning:free`. Edit `config/models.toml` to change answer, judge, or query-rewrite models. Free model availability and context windows are checked against the OpenRouter catalog.
 
@@ -73,6 +72,10 @@ streamlit run app.py
 - Measure reference-source hit@10 and source-level NDCG@10, and estimate QA accuracy on a stratified sample of 10–100 questions.
 - Build indexes by streaming corpus records and embedding batches with visible progress. Wikipedia remains the default source for a smaller first index.
 - View each configured model's context window when OpenRouter provides it.
+- Compare Dense, BM25, and Hybrid (BM25 + dense) retrieval. Hybrid ranking uses Reciprocal Rank Fusion.
+- Select direct Groq, OpenAI, xAI, Mistral, and Google models alongside OpenRouter models. Provider rotation follows the ordered list in `config/models.toml` and advances only after transient failures.
+- Tune chunk size, overlap, top-k, and vector store on a deterministic tuning split. Run a selected configuration once on the separate holdout split.
+- Record index build time, search p50/p95, Recall@K, NDCG@K, environment details, and available process RAM/CPU metrics in `knowledge_base/runs/runs.jsonl`.
 
 ### Jolpica attribution
 
@@ -89,6 +92,8 @@ python -m pip install -r requirements-vectorstores.txt
 If the FAISS wheel is incompatible with your Python/Windows setup, use NumPy or ChromaDB.
 
 Generated indexes are rebuildable, stored under `knowledge_base/indices/`, and excluded from Git. The self-contained corpus and QA files remain in the repository so it can be published without the original raw data.
+
+Install optional process resource measurements with `python -m pip install -r requirements-benchmark.txt`. Without `psutil`, timing and quality metrics still run; RAM and CPU fields are `null`.
 
 > **Evaluation note:** Each QA row contains one source label rather than a complete set of relevant document or chunk IDs. The reported reference-source hit rate checks whether that source appears in the first 10 results, and NDCG deduplicates results at the source level. Neither is standard document/chunk Recall@10 or NDCG@10. A judged qrels file with all relevant IDs per question is needed for strict information-retrieval metrics. QA accuracy is a stratified sample estimate, not a corpus-wide score; LLM judgments should be calibrated with human review.
 

@@ -6,11 +6,6 @@ from collections.abc import Iterable
 from typing import Any
 
 
-def relevant_sources(qa_row: dict[str, Any]) -> set[str]:
-    source = qa_row.get("source")
-    return {str(source)} if source else set()
-
-
 def recall_at_n(retrieved: Iterable[dict[str, Any]], relevant: set[str], n: int = 10) -> float:
     if not relevant:
         return 0.0
@@ -38,23 +33,36 @@ def ndcg_at_n(retrieved: Iterable[dict[str, Any]], relevant: set[str], n: int = 
     return dcg / ideal_dcg if ideal_dcg else 0.0
 
 
-def retrieval_metrics(
-    qa_rows: list[dict[str, Any]],
-    retrieve: Any,
+def recall_ids_at_n(
+    retrieved: Iterable[dict[str, Any]],
+    relevant_ids: set[str],
     n: int = 10,
-) -> dict[str, float | int]:
-    recall_scores: list[float] = []
-    ndcg_scores: list[float] = []
-    for row in qa_rows:
-        relevant = relevant_sources(row)
-        hits = retrieve(str(row["question"]), n)
-        recall_scores.append(recall_at_n(hits, relevant, n))
-        ndcg_scores.append(ndcg_at_n(hits, relevant, n))
-    return {
-        "questions": len(qa_rows),
-        f"recall@{n}": sum(recall_scores) / len(recall_scores) if recall_scores else 0.0,
-        f"ndcg@{n}": sum(ndcg_scores) / len(ndcg_scores) if ndcg_scores else 0.0,
-    }
+) -> float:
+    if n < 1:
+        raise ValueError("n must be greater than zero.")
+    if not relevant_ids:
+        return 0.0
+    found = {str(row.get("id")) for row in list(retrieved)[:n]}
+    return len(found & relevant_ids) / len(relevant_ids)
+
+
+def ndcg_ids_at_n(
+    retrieved: Iterable[dict[str, Any]],
+    relevance_by_id: dict[str, int],
+    n: int = 10,
+) -> float:
+    """Compute graded NDCG using document/chunk IDs and relevance grades."""
+    if n < 1:
+        raise ValueError("n must be greater than zero.")
+    if not relevance_by_id:
+        return 0.0
+    dcg = 0.0
+    for rank, row in enumerate(list(retrieved)[:n], start=1):
+        grade = max(0, int(relevance_by_id.get(str(row.get("id")), 0)))
+        dcg += (2**grade - 1) / math.log2(rank + 1)
+    ideal_grades = sorted((int(grade) for grade in relevance_by_id.values() if int(grade) > 0), reverse=True)[:n]
+    ideal_dcg = sum((2**grade - 1) / math.log2(rank + 1) for rank, grade in enumerate(ideal_grades, start=1))
+    return dcg / ideal_dcg if ideal_dcg else 0.0
 
 
 def stratified_sample(
