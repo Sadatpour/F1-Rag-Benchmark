@@ -13,6 +13,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from f1_rag.chunking import chunk_documents
+from f1_rag.embeddings import DEFAULT_EMBEDDING_MODEL, EMBEDDING_PROFILES
 from f1_rag.evaluation import (
     ndcg_at_n,
     qa_accuracy,
@@ -21,7 +22,15 @@ from f1_rag.evaluation import (
 )
 from f1_rag.ingest import build_knowledge_base, load_documents
 from f1_rag.model_config import MODEL_CONFIG_PATH, load_model_config
-from f1_rag.openrouter import DEFAULT_JUDGE_MODEL, answer_question, chat_completion, judge_answer
+from f1_rag.openrouter import (
+    DEFAULT_JUDGE_MODEL,
+    answer_question,
+    chat_completion,
+    judge_answer,
+    list_models,
+    rewrite_query,
+    rewrite_query_safely,
+)
 from f1_rag.retrieval import _fingerprint, embed_documents
 from f1_rag.sources import JOLPICA_API_BASE, jolpica_source_url, wikipedia_source_url
 from f1_rag.stores import NumpyStore
@@ -125,6 +134,11 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertIn("cohere/north-mini-code:free", config["openrouter"]["answer_models"])
         self.assertEqual(config["openrouter"]["judge_model"], "nvidia/nemotron-3.5-lightning:free")
+        self.assertIn(DEFAULT_EMBEDDING_MODEL, EMBEDDING_PROFILES)
+        self.assertEqual(
+            EMBEDDING_PROFILES[DEFAULT_EMBEDDING_MODEL]["repo_id"],
+            "sentence-transformers/all-MiniLM-L6-v2",
+        )
 
     def test_invalid_model_config_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -157,8 +171,15 @@ class RetrievalTests(unittest.TestCase):
             corpus = Path(temporary) / "wikipedia.jsonl"
             corpus.write_text("{}\n", encoding="utf-8")
             fingerprint = _fingerprint(corpus, chunk_size=500, overlap=80)
+            other_model_fingerprint = _fingerprint(
+                corpus,
+                chunk_size=500,
+                overlap=80,
+                embedding_model_id="another/embedding-model",
+            )
 
         self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(fingerprint, other_model_fingerprint)
 
     def test_documents_are_embedded_in_batches_with_progress(self) -> None:
         class WhitespaceTokenizer:
@@ -212,6 +233,26 @@ class RetrievalTests(unittest.TestCase):
 
 class OpenRouterTests(unittest.TestCase):
     @patch("f1_rag.openrouter._request")
+    def test_model_catalog_uses_api_key_and_returns_only_free_models(self, request):
+        request.return_value = {
+            "data": [
+                {"id": "org/free:free", "name": "Free", "context_length": 4096},
+                {"id": "org/paid", "pricing": {"prompt": "0.1", "completion": "0.2"}},
+            ]
+        }
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            models = list_models()
+
+        self.assertEqual(models, {"org/free:free": {"context_length": 4096, "name": "Free"}})
+        self.assertEqual(request.call_args.args[1]["Authorization"], "Bearer test-key")
+
+    @patch("f1_rag.openrouter._request")
+    def test_model_catalog_skips_request_without_api_key(self, request):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(list_models(), {})
+        request.assert_not_called()
+
+    @patch("f1_rag.openrouter._request")
     def test_reasoning_budget_exhaustion_reports_why_completion_is_empty(self, request) -> None:
         request.return_value = {
             "choices": [{"finish_reason": "length", "message": {"content": None}}],
@@ -241,6 +282,33 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(request.call_args.args[2]["response_format"], {"type": "json_object"})
         self.assertEqual(request.call_args.args[2]["reasoning"], {"effort": "none"})
         self.assertEqual(request.call_args.args[2]["max_tokens"], 500)
+
+    @patch("f1_rag.openrouter.chat_completion")
+    def test_query_rewrite_returns_one_clean_search_query(self, completion) -> None:
+        completion.return_value = '```text\n"mika hakkinen 1998 championship wins"\n```'
+
+        query = rewrite_query("Who won the 1998 F1 championship?", "test/model", "overview", "key")
+
+        self.assertEqual(query, "mika hakkinen 1998 championship wins")
+        self.assertEqual(completion.call_args.kwargs["max_tokens"], 96)
+        self.assertEqual(completion.call_args.kwargs["temperature"], 0)
+        self.assertIn("Do not answer the question", completion.call_args.args[1][0]["content"])
+
+    @patch("f1_rag.openrouter.rewrite_query")
+    def test_failed_or_empty_query_rewrite_uses_original_question(self, rewrite) -> None:
+        question = "Who won the 1998 F1 championship?"
+        rewrite.side_effect = RuntimeError("provider is unavailable")
+        self.assertEqual(
+            rewrite_query_safely(question, "test/model", "overview", "key"),
+            (question, "Rewrite failed; the original question was used. provider is unavailable"),
+        )
+
+        rewrite.side_effect = None
+        rewrite.return_value = "  "
+        self.assertEqual(
+            rewrite_query_safely(question, "test/model", "overview", "key"),
+            (question, "The rewrite model returned an empty query; the original question was used."),
+        )
 
     @patch("f1_rag.openrouter.chat_completion")
     def test_answer_treats_context_as_data_and_removes_unknown_citations(self, completion) -> None:

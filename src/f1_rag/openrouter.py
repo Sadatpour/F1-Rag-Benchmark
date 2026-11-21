@@ -57,7 +57,14 @@ def _request(
 
 
 def list_models() -> dict[str, dict[str, Any]]:
-    response = _request(f"{OPENROUTER_URL}/models", {"Accept": "application/json"}, timeout=20)
+    api_key = get_api_key()
+    if not api_key:
+        return {}
+    response = _request(
+        f"{OPENROUTER_URL}/models",
+        {"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+        timeout=20,
+    )
     if not isinstance(response, dict) or not isinstance(response.get("data"), list):
         raise RuntimeError("OpenRouter returned an unexpected model catalog.")
     models: dict[str, dict[str, Any]] = {}
@@ -161,8 +168,10 @@ def rewrite_query(question: str, model: str, corpus_preview: str, api_key: str) 
                 "role": "system",
                 "content": (
                     "Rewrite the user's question as one concise, standalone search query for a Formula 1 "
-                    "retrieval system. Preserve names, dates, and intent. Use the collection overview only "
-                    "to clarify terminology. Return only an English query, with no explanation."
+                    "knowledge base written in English. Do not answer the question. Preserve names, dates, "
+                    "negation, and intent. Translate the query to English when needed. Keep changes minimal; "
+                    "use the collection overview only to resolve names or terminology. Return one query of "
+                    "at most 30 words, with no explanation or multiple alternatives."
                 ),
             },
             {
@@ -171,9 +180,28 @@ def rewrite_query(question: str, model: str, corpus_preview: str, api_key: str) 
             },
         ],
         api_key,
-        max_tokens=1800,
+        max_tokens=96,
+        temperature=0,
     )
-    return rewritten.strip().strip('"')
+    cleaned = re.sub(r"^```(?:text)?\s*|\s*```$", "", rewritten.strip(), flags=re.IGNORECASE)
+    cleaned = cleaned.strip().strip('"').strip("'").strip()
+    return " ".join(cleaned.splitlines()).strip()
+
+
+def rewrite_query_safely(
+    question: str,
+    model: str,
+    corpus_preview: str,
+    api_key: str,
+) -> tuple[str, str | None]:
+    """Return a rewritten query, or the original query with a diagnostic."""
+    try:
+        rewritten = rewrite_query(question, model, corpus_preview, api_key).strip()
+    except (RuntimeError, ValueError, OSError) as error:
+        return question, f"Rewrite failed; the original question was used. {error}"
+    if not rewritten:
+        return question, "The rewrite model returned an empty query; the original question was used."
+    return rewritten, None
 
 
 def judge_answer(

@@ -30,12 +30,15 @@ class BenchmarkConfig:
     top_k: int
     repeats: int = 5
     evaluation_split: str = "tuning"
+    metric_ks: tuple[int, ...] = ()
 
     def validate(self) -> None:
         if self.chunk_size < 1 or self.overlap < 0 or self.overlap >= self.chunk_size:
             raise ValueError("Require chunk_size > 0 and 0 <= overlap < chunk_size.")
         if self.top_k < 1 or self.repeats < 1:
             raise ValueError("top_k and repeats must be greater than zero.")
+        if any(k < 1 for k in self.metric_ks):
+            raise ValueError("All metric cutoffs must be greater than zero.")
         if self.evaluation_split not in {"tuning", "holdout"}:
             raise ValueError("evaluation_split must be 'tuning' or 'holdout'.")
 
@@ -108,8 +111,10 @@ def benchmark_store(
     output_dir.mkdir(parents=True, exist_ok=True)
     build_seconds: list[float] = []
     search_latencies: list[float] = []
-    recalls: list[float] = []
-    ndcgs: list[float] = []
+    cutoffs = tuple(sorted(set(config.metric_ks or (config.top_k,))))
+    search_limit = max(config.top_k, *cutoffs)
+    recalls: dict[int, list[float]] = {k: [] for k in cutoffs}
+    ndcgs: dict[int, list[float]] = {k: [] for k in cutoffs}
     memory_deltas: list[int] = []
     cpu_deltas: list[float] = []
     search_cpu_deltas: list[float] = []
@@ -132,10 +137,18 @@ def benchmark_store(
                     cpu_deltas.append(cpu_delta)
 
                 search_before = _process_resources()
+                query_hits: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
                 for row, query_vector in zip(queries, query_vectors, strict=True):
                     started = time.perf_counter()
-                    hits = store.search(query_vector, config.top_k)
+                    hits = store.search(query_vector, search_limit)
                     search_latencies.append((time.perf_counter() - started) * 1000)
+                    query_hits.append((row, hits))
+                search_after = _process_resources()
+                _, search_cpu_delta = _resource_delta(search_before, search_after)
+                if search_cpu_delta is not None:
+                    search_cpu_deltas.append(search_cpu_delta)
+
+                for row, hits in query_hits:
                     if relevance_level == "document_or_chunk_id":
                         relevance = {
                             str(document_id): int(grade)
@@ -146,18 +159,16 @@ def benchmark_store(
                             str(document_id): max(1, relevance.get(str(document_id), 0))
                             for document_id in row.get("relevant_ids", [])
                         })
-                        recalls.append(recall_ids_at_n(hits, set(relevance), config.top_k))
-                        ndcgs.append(ndcg_ids_at_n(hits, relevance, config.top_k))
+                        for cutoff in cutoffs:
+                            recalls[cutoff].append(recall_ids_at_n(hits, set(relevance), cutoff))
+                            ndcgs[cutoff].append(ndcg_ids_at_n(hits, relevance, cutoff))
                     else:
                         relevant = {str(value) for value in row.get("relevant_sources", [])}
                         if not relevant and row.get("source"):
                             relevant = {str(row["source"])}
-                        recalls.append(recall_at_n(hits, relevant, config.top_k))
-                        ndcgs.append(ndcg_at_n(hits, relevant, config.top_k))
-                search_after = _process_resources()
-                _, search_cpu_delta = _resource_delta(search_before, search_after)
-                if search_cpu_delta is not None:
-                    search_cpu_deltas.append(search_cpu_delta)
+                        for cutoff in cutoffs:
+                            recalls[cutoff].append(recall_at_n(hits, relevant, cutoff))
+                            ndcgs[cutoff].append(ndcg_at_n(hits, relevant, cutoff))
             except Exception as error:
                 failure = f"{type(error).__name__}: {error}"
                 break
@@ -192,8 +203,19 @@ def benchmark_store(
             "search_latency_ms_p50": percentile(search_latencies, 0.50) if search_latencies else None,
             "search_latency_ms_p95": percentile(search_latencies, 0.95) if search_latencies else None,
             "search_latency_ms_mean": statistics.fmean(search_latencies) if search_latencies else None,
-            "recall_at_k": statistics.fmean(recalls) if recalls else None,
-            "ndcg_at_k": statistics.fmean(ndcgs) if ndcgs else None,
+            "metrics_at_k": {
+                str(k): {
+                    "recall": statistics.fmean(recalls[k]) if recalls[k] else None,
+                    "ndcg": statistics.fmean(ndcgs[k]) if ndcgs[k] else None,
+                }
+                for k in cutoffs
+            },
+            "recall_at_k": statistics.fmean(recalls[config.top_k])
+            if config.top_k in recalls and recalls[config.top_k]
+            else None,
+            "ndcg_at_k": statistics.fmean(ndcgs[config.top_k])
+            if config.top_k in ndcgs and ndcgs[config.top_k]
+            else None,
             "rss_delta_bytes_median": statistics.median(memory_deltas) if memory_deltas else None,
             "index_build_cpu_seconds_median": statistics.median(cpu_deltas) if cpu_deltas else None,
             "search_cpu_seconds_median": statistics.median(search_cpu_deltas) if search_cpu_deltas else None,
@@ -214,6 +236,7 @@ def run_hyperparameter_grid(
     chunk_sizes: Iterable[int],
     overlaps: Iterable[int],
     top_ks: Iterable[int],
+    metric_ks: Iterable[int] | None = None,
     repeats: int,
     prepare: Callable[[int, int], tuple[list[dict[str, Any]], np.ndarray, Callable[[str], np.ndarray]]],
     queries: list[dict[str, Any]],
@@ -237,6 +260,7 @@ def run_hyperparameter_grid(
                         top_k=top_k,
                         repeats=repeats,
                         evaluation_split="tuning",
+                        metric_ks=tuple(metric_ks or (top_k,)),
                     )
                     results.append(
                         benchmark_store(config, documents, vectors, queries, encode_query, output_dir)

@@ -48,11 +48,15 @@ The answer model defaults to `cohere/north-mini-code:free`; the free judge defau
 
 ### Embedding model
 
-The app loads the local `sentence-transformers/all-MiniLM-L6-v2` snapshot from `models/embedding/all-MiniLM-L6-v2/`. Download it with:
+The sidebar lets you select the embedding model. The default is `sentence-transformers/all-MiniLM-L6-v2`, loaded from `models/embedding/all-MiniLM-L6-v2/`. Add future local models under `[embedding.models]` in `config/models.toml`, then set `embedding.default_model` to the desired profile. Each profile defines its Hugging Face repo ID, local path, and optional safetensors path. The selected profile is used for query vectors, corpus vectors, retrieval evaluation, and benchmarks. Its ID and paths are part of the index fingerprint, so changing models builds or loads a separate compatible index.
+
+Download the default model with:
 
 ```powershell
 hf download sentence-transformers/all-MiniLM-L6-v2 --local-dir ./models/embedding/all-MiniLM-L6-v2
 ```
+
+The reranker files are loaded from `models/reranker/ms-marco-MiniLM-L6-v2/`. The sidebar can rerank a candidate pool (default 30) and pass the final Top K to the answer model. Add profiles under `[reranking.models]` and set `[reranking].default_model` in `config/models.toml`. Model weights stay local and are excluded from Git. The configured MS MARCO model is English-focused, and its raw scores are ranking logits, not confidence probabilities.
 
 The model files are ignored by Git. The model ID, snapshot path, and weights path are configured in `config/models.toml`.
 
@@ -66,16 +70,19 @@ streamlit run app.py
 
 - Select Wikipedia or Jolpica as the knowledge source.
 - Compare answers across multiple LLMs and three vector stores: exact NumPy cosine, FAISS, and ChromaDB.
-- Configure embedding-token chunk sizes (128, 192, or 224), token overlap, and 1–10 retrieved chunks. The chunks use the embedding model tokenizer and stay below its 256-token input limit.
+- Use the sidebar to switch between asking questions, evaluation/benchmarking, and the project guide. Each evaluation mode has its own settings.
+- Configure embedding-token chunk sizes (128, 192, or 224), token overlap, and Top K values 1, 3, and 5. The chunks use the embedding model tokenizer and stay below its 256-token input limit.
 - Optionally rewrite the query before embedding.
 - Toggle answer judging on or off, and choose a separate judge model when enabled.
-- Measure reference-source hit@10 and source-level NDCG@10, and estimate QA accuracy on a stratified sample of 10–100 questions.
+- Measure source-level Recall@K and NDCG@K at selected K values, and estimate generated-answer accuracy on a stratified sample of 10–100 questions.
 - Build indexes by streaming corpus records and embedding batches with visible progress. Wikipedia remains the default source for a smaller first index.
 - View each configured model's context window when OpenRouter provides it.
 - Compare Dense, BM25, and Hybrid (BM25 + dense) retrieval. Hybrid ranking uses Reciprocal Rank Fusion.
-- Select direct Groq, OpenAI, xAI, Mistral, and Google models alongside OpenRouter models. Provider rotation follows the ordered list in `config/models.toml` and advances only after transient failures.
+- Optionally rerank a candidate pool with a local CrossEncoder before sending the final Top K chunks to answer models. The configured MS MARCO MiniLM model scores query/chunk pairs; it does not replace the embedding model or retrieve documents on its own.
+- Select direct Groq, OpenAI, xAI, Mistral, and Google models alongside OpenRouter models. Provider rotation follows `answer_rotation` in `config/models.toml`; quota, access, billing, model, network, and server failures move to the next compatible model. Failed models stay in a persisted cooldown to avoid repeating known failures on each request.
+- Compare vector-store index build time, search p50/p95, process RAM/CPU, Recall@K, and NDCG@K with the same corpus vectors and questions.
 - Tune chunk size, overlap, top-k, and vector store on a deterministic tuning split. Run a selected configuration once on the separate holdout split.
-- Record index build time, search p50/p95, Recall@K, NDCG@K, environment details, and available process RAM/CPU metrics in `knowledge_base/runs/runs.jsonl`.
+- Record settings, metrics, run IDs, and hardware/software details in `knowledge_base/runs/runs.jsonl`.
 
 ### Jolpica attribution
 
@@ -93,9 +100,9 @@ If the FAISS wheel is incompatible with your Python/Windows setup, use NumPy or 
 
 Generated indexes are rebuildable, stored under `knowledge_base/indices/`, and excluded from Git. The self-contained corpus and QA files remain in the repository so it can be published without the original raw data.
 
-Install optional process resource measurements with `python -m pip install -r requirements-benchmark.txt`. Without `psutil`, timing and quality metrics still run; RAM and CPU fields are `null`.
+Process resource measurements use `psutil`, which is installed with the project requirements. If an older environment does not have it, install project requirements again with `python -m pip install -r requirements.txt`.
 
-> **Evaluation note:** Each QA row contains one source label rather than a complete set of relevant document or chunk IDs. The reported reference-source hit rate checks whether that source appears in the first 10 results, and NDCG deduplicates results at the source level. Neither is standard document/chunk Recall@10 or NDCG@10. A judged qrels file with all relevant IDs per question is needed for strict information-retrieval metrics. QA accuracy is a stratified sample estimate, not a corpus-wide score; LLM judgments should be calibrated with human review.
+> **Evaluation note:** Each QA row contains one source label rather than a complete set of relevant document or chunk IDs. Recall@K and NDCG@K therefore use source-level labels; NDCG deduplicates results by source. These are not document/chunk-level relevance metrics. A judged qrels file with relevant IDs per question is needed for strict document or chunk Recall/NDCG. QA accuracy is a stratified sample estimate, not a corpus-wide score; calibrate LLM judgments with human review.
 
 > **Context and prompt safety:** Answer context is budgeted conservatively using UTF-8 byte counts, reserving room for system instructions, the question, and the maximum answer. Retrieved documents are explicitly treated as untrusted data, and citations are limited to references included in the prompt.
 

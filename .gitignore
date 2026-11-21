@@ -21,6 +21,7 @@ dist/
 # Downloaded weights, caches and generated vector indexes
 models/embedding/*
 !models/embedding/.gitkeep
+/models/reranker/
 *.safetensors
 knowledge_base/indices/
 knowledge_base/runs/

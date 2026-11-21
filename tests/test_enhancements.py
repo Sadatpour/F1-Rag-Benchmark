@@ -14,8 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from f1_rag.benchmark import BenchmarkConfig, benchmark_store
 from f1_rag.model_config import load_model_config
-from f1_rag.providers import CompletionResult, ProviderRequestError, ProviderRouter, configured_models
+from f1_rag.providers import (
+    CompletionResult,
+    ProviderRequestError,
+    ProviderRouter,
+    _classify_http_error,
+    configured_models,
+)
 from f1_rag.evaluation import ndcg_ids_at_n, recall_ids_at_n
+from f1_rag.reranking import DEFAULT_RERANKER_MODEL, RERANKER_PROFILES, rerank_candidates
 from f1_rag.sparse import BM25Index, hybrid_search
 from f1_rag.stores import create_store
 
@@ -52,6 +59,26 @@ class QrelsMetricTests(unittest.TestCase):
         self.assertEqual(recall_ids_at_n(hits, set(relevant), n=2), 1.0)
         self.assertLess(ndcg_ids_at_n(hits, relevant, n=2), 1.0)
         self.assertEqual(ndcg_ids_at_n([{"id": "a"}, {"id": "b"}], relevant, n=2), 1.0)
+
+
+class RerankingTests(unittest.TestCase):
+    def test_cross_encoder_scores_reorder_candidates_and_keep_retrieval_rank(self) -> None:
+        class FakeCrossEncoder:
+            @staticmethod
+            def predict(pairs, **_kwargs):
+                return [0.1, 0.9, 0.5]
+
+        candidates = [
+            {"id": "a", "text": "first passage", "score": 0.8},
+            {"id": "b", "text": "second passage", "score": 0.7},
+            {"id": "c", "text": "third passage", "score": 0.6},
+        ]
+        ranked = rerank_candidates(FakeCrossEncoder(), "question", candidates, final_k=2)
+
+        self.assertEqual([item["id"] for item in ranked], ["b", "c"])
+        self.assertEqual([item["retrieval_rank"] for item in ranked], [2, 3])
+        self.assertEqual([item["rerank_score"] for item in ranked], [0.9, 0.5])
+        self.assertIn(DEFAULT_RERANKER_MODEL, RERANKER_PROFILES)
 
 
 class ProviderTests(unittest.TestCase):
@@ -142,6 +169,77 @@ class ProviderTests(unittest.TestCase):
                 "grok::grok-4.6", "mistral::mistral-small-2603"
             ])
 
+    def test_access_and_daily_quota_errors_are_fallbackable(self) -> None:
+        access = _classify_http_error(403, "", "", "access denied by security policy")
+        quota = _classify_http_error(429, "quota_exceeded", "", "daily token quota exceeded")
+        generic_quota = _classify_http_error(403, "", "", "You have exceeded your quota")
+        billing = _classify_http_error(429, "credit_balance_exhausted", "", "Add credits")
+        invalid_request = _classify_http_error(400, "invalid_request", "", "bad parameter")
+
+        self.assertEqual(access, ("access_denied", True, 900))
+        self.assertEqual(quota, ("quota_exhausted", True, 86400))
+        self.assertEqual(generic_quota, ("quota_exhausted", True, 3600))
+        self.assertEqual(billing, ("billing_unavailable", True, 3600))
+        self.assertEqual(invalid_request, ("request_rejected", False, 0))
+
+    def test_rotation_skips_provider_during_persisted_quota_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "provider-calls.jsonl"
+            router = ProviderRouter(self.config, event_path)
+            openrouter_failure = ProviderRequestError(
+                "quota exhausted",
+                fallbackable=True,
+                category="quota_exhausted",
+                cooldown_seconds=86400,
+            )
+            success = CompletionResult("google", "gemma-4-31b-it", "ok", 9.0, 1, 1, None, "stop")
+            with patch.dict(
+                "os.environ",
+                {"OPENROUTER_API_KEY": "or-test", "GOOGLE_API_KEY": "google-test"},
+            ), patch.object(router, "complete", side_effect=[openrouter_failure, success, success]) as complete:
+                first = router.rotate(
+                    ["openrouter::openrouter/free", "gemini::gemma-4-31b-it"], []
+                )
+                second = router.rotate(
+                    ["openrouter::openrouter/free", "gemini::gemma-4-31b-it"], []
+                )
+
+            self.assertEqual(first.provider, "google")
+            self.assertEqual(second.provider, "google")
+            self.assertEqual([call.args[0] for call in complete.call_args_list], [
+                "openrouter::openrouter/free",
+                "gemini::gemma-4-31b-it",
+                "gemini::gemma-4-31b-it",
+            ])
+            persisted = json.loads((Path(temporary) / "provider-cooldowns.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["openrouter::openrouter/free"]["category"], "quota_exhausted")
+
+    def test_rotation_error_reports_each_provider_status_and_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            router = ProviderRouter(self.config, Path(temporary) / "events.jsonl")
+            rotation = self.config["routing"]["answer_rotation"]
+            env = {
+                router.providers[router.models[name].provider].api_key_env: "test-key"
+                for name in rotation
+            }
+            failures = [
+                ProviderRequestError(
+                    f"{name} denied",
+                    fallbackable=True,
+                    category="access_denied",
+                    http_status=403,
+                    provider_code="permission_denied",
+                    provider_message=f"{name} permission denied",
+                )
+                for name in rotation
+            ]
+            with patch.dict("os.environ", env), patch.object(router, "complete", side_effect=failures):
+                with self.assertRaisesRegex(RuntimeError, "HTTP 403.*permission denied") as raised:
+                    router.rotate(rotation, [])
+
+            for name in rotation:
+                self.assertIn(name, str(raised.exception))
+
 
 class BenchmarkTests(unittest.TestCase):
     def test_numpy_benchmark_records_repeatable_metrics_and_metadata(self) -> None:
@@ -154,7 +252,10 @@ class BenchmarkTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             result = benchmark_store(
-                BenchmarkConfig("test", "NumPy (exact)", "test-embedder", 128, 16, 1, repeats=2),
+                BenchmarkConfig(
+                    "test", "NumPy (exact)", "test-embedder", 128, 16, 2,
+                    repeats=2, metric_ks=(1, 2),
+                ),
                 documents,
                 vectors,
                 queries,
@@ -166,7 +267,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsNone(result["error"])
         self.assertEqual(result["results"]["successful_repeats"], 2)
         self.assertEqual(result["results"]["recall_at_k"], 1.0)
+        self.assertEqual(result["results"]["metrics_at_k"]["1"]["recall"], 1.0)
+        self.assertEqual(result["results"]["metrics_at_k"]["2"]["ndcg"], 1.0)
         self.assertGreaterEqual(result["results"]["search_latency_ms_p95"], 0)
+        self.assertTrue(result["results"]["resource_metrics_available"])
+        self.assertIsNotNone(result["results"]["rss_delta_bytes_median"])
         self.assertEqual(result["config"]["embedding_model"], "test-embedder")
         self.assertEqual(len(rows), 1)
 

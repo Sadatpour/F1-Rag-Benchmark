@@ -26,6 +26,22 @@ def load_model_config(path: Path = MODEL_CONFIG_PATH) -> dict[str, Any]:
     weights_path = embedding.get("weights_path", "")
     if not isinstance(weights_path, str):
         raise ValueError(f"{path} embedding.weights_path must be a path string.")
+    embedding_models = embedding.get("models")
+    if embedding_models is not None:
+        if not isinstance(embedding_models, dict) or not embedding_models:
+            raise ValueError(f"{path} embedding.models must be a non-empty table.")
+        for name, profile in embedding_models.items():
+            if not isinstance(profile, dict):
+                raise ValueError(f"{path} embedding.models.{name} must be a table.")
+            for field in ("repo_id", "local_path"):
+                if not isinstance(profile.get(field), str) or not profile[field].strip():
+                    raise ValueError(f"{path} embedding.models.{name}.{field} is required.")
+            profile_weights = profile.get("weights_path", "")
+            if not isinstance(profile_weights, str):
+                raise ValueError(f"{path} embedding.models.{name}.weights_path must be a path string.")
+        default_embedding = embedding.get("default_model")
+        if default_embedding not in embedding_models:
+            raise ValueError(f"{path} embedding.default_model must match an embedding.models entry.")
     answer_models = openrouter.get("answer_models")
     if not isinstance(answer_models, list) or not answer_models:
         raise ValueError(f"{path} must define at least one openrouter.answer_models entry.")
@@ -37,6 +53,28 @@ def load_model_config(path: Path = MODEL_CONFIG_PATH) -> dict[str, Any]:
     additional = openrouter.get("additional_models", [])
     if not isinstance(additional, list) or any(not isinstance(model, str) or not model.strip() for model in additional):
         raise ValueError(f"{path} openrouter.additional_models must be a list of model IDs.")
+
+    reranking = config.get("reranking", {})
+    if not isinstance(reranking, dict):
+        raise ValueError(f"{path} reranking must be a TOML table.")
+    reranker_models = reranking.get("models", {})
+    if not isinstance(reranker_models, dict):
+        raise ValueError(f"{path} reranking.models must be a TOML table.")
+    if reranker_models:
+        for name, profile in reranker_models.items():
+            if not isinstance(profile, dict):
+                raise ValueError(f"{path} reranking.models.{name} must be a table.")
+            for field in ("repo_id", "local_path"):
+                if not isinstance(profile.get(field), str) or not profile[field].strip():
+                    raise ValueError(f"{path} reranking.models.{name}.{field} is required.")
+            max_length = profile.get("max_length", 512)
+            if not isinstance(max_length, int) or max_length < 1:
+                raise ValueError(f"{path} reranking.models.{name}.max_length must be positive.")
+        if reranking.get("default_model") not in reranker_models:
+            raise ValueError(f"{path} reranking.default_model must match a reranking.models entry.")
+    candidate_count = reranking.get("candidate_count", 30)
+    if not isinstance(candidate_count, int) or candidate_count < 1:
+        raise ValueError(f"{path} reranking.candidate_count must be positive.")
 
     windows = config.get("context_windows", {})
     if not isinstance(windows, dict) or any(
