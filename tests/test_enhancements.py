@@ -12,7 +12,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from f1_rag.benchmark import BenchmarkConfig, benchmark_store
+from f1_rag.benchmark import BenchmarkConfig, benchmark_store, run_hyperparameter_grid
 from f1_rag.model_config import load_model_config
 from f1_rag.providers import (
     CompletionResult,
@@ -242,6 +242,31 @@ class ProviderTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_grid_forwards_tuning_queries_to_each_benchmark(self) -> None:
+        documents = [{"id": "one", "source": "one", "text": "champion"}]
+        vectors = np.array([[1, 0]], dtype=np.float32)
+        queries = [{"question": "champion", "source": "one"}]
+        encode_query = lambda _text: np.array([1, 0], dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "f1_rag.benchmark.benchmark_store", return_value={"run_id": "expected"}
+        ) as benchmark:
+            results = run_hyperparameter_grid(
+                dataset="test",
+                store_names=["NumPy (exact)"],
+                embedding_model="test-embedder",
+                chunk_sizes=[128],
+                overlaps=[16],
+                top_ks=[1],
+                repeats=1,
+                prepare=lambda _size, _overlap: (documents, vectors, encode_query),
+                queries=queries,
+                output_dir=Path(temporary),
+            )
+
+        self.assertEqual(results, [{"run_id": "expected"}])
+        self.assertEqual(benchmark.call_args.args[3], queries)
+
     def test_numpy_benchmark_records_repeatable_metrics_and_metadata(self) -> None:
         documents = [
             {"id": "one", "source": "one", "text": "champion"},
