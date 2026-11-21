@@ -231,7 +231,7 @@ def benchmark_store(
 def run_hyperparameter_grid(
     *,
     dataset: str,
-    store_names: list[str],
+    store_names: Iterable[str],
     embedding_model: str,
     chunk_sizes: Iterable[int],
     overlaps: Iterable[int],

@@ -6,6 +6,7 @@ from http.client import HTTPException
 import json
 import logging
 import sys
+from collections.abc import Sequence
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,12 @@ from f1_rag.reranking import (
     reranker_profile,
 )
 from f1_rag.retrieval import embed_documents, encode_query, load_evaluation_rows, prepare_index
+from f1_rag.reporting import (
+    dataframe_to_csv,
+    dataframe_to_pdf,
+    load_evaluation_runs,
+    save_evaluation_run,
+)
 from f1_rag.sources import (
     JOLPICA_API_BASE,
     JOLPICA_ATTRIBUTION,
@@ -533,6 +540,12 @@ model_options = list(
     )
 )
 
+eval_store_names: Sequence[str] = ()
+qa_store_names: Sequence[str] = ()
+benchmark_stores: Sequence[str] = ()
+tuning_stores: Sequence[str] = ()
+holdout_stores: Sequence[str] = ()
+
 with st.sidebar:
     st.markdown("## :material/speed: Apex RAG")
     st.caption("F1 knowledge lab")
@@ -805,13 +818,119 @@ def _benchmark_table(results: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _retrieval_table(results: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for item in results:
+        row = {key: value for key, value in item.items() if key != "metrics_at_k"}
+        for cutoff, metrics in item["metrics_at_k"].items():
+            row[f"Recall@{cutoff}"] = metrics["recall"]
+            row[f"NDCG@{cutoff}"] = metrics["ndcg"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _record_evaluation(
+    test_type: str,
+    configuration: dict[str, Any],
+    frame: pd.DataFrame,
+    errors: list[str],
+) -> None:
+    try:
+        rows = [
+            {str(key): value for key, value in row.items()}
+            for row in frame.to_dict(orient="records")
+        ]
+        save_evaluation_run(
+            KNOWLEDGE_BASE / "runs",
+            test_type=test_type,
+            dataset=dataset,
+            configuration=configuration,
+            rows=rows,
+            errors=errors,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        st.error(f"Could not save this evaluation run: {error}")
+
+
+def _show_export_buttons(frame: pd.DataFrame, title: str, key_prefix: str) -> None:
+    csv_column, pdf_column = st.columns(2)
+    csv_column.download_button(
+        "Download CSV",
+        data=dataframe_to_csv(frame),
+        file_name=f"{key_prefix}.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_csv",
+        on_click="ignore",
+    )
+    pdf_column.download_button(
+        "Download PDF",
+        data=dataframe_to_pdf(frame, title),
+        file_name=f"{key_prefix}.pdf",
+        mime="application/pdf",
+        key=f"{key_prefix}_pdf",
+        on_click="ignore",
+    )
+
+
 def _show_metric_table(results: list[dict[str, Any]], alt: str) -> None:
     if results:
-        st.dataframe(_benchmark_table(results), hide_index=True, width="stretch", alt=alt)
+        frame = _benchmark_table(results)
+        st.dataframe(frame, hide_index=True, width="stretch", alt=alt)
+        _show_export_buttons(frame, alt, "benchmark-results")
         st.caption(
             "Lower latency, RAM, and CPU use reduce resource cost. Higher Recall@K and NDCG@K improve retrieval. "
             "Resource values cover index construction and search in this Python process; they exclude embedding generation."
         )
+
+
+def _show_saved_evaluation_history(selected_dataset: str) -> None:
+    try:
+        records = load_evaluation_runs(KNOWLEDGE_BASE / "runs", dataset=selected_dataset)
+    except (OSError, ValueError) as error:
+        st.error(f"Could not load saved evaluation history: {error}")
+        return
+    if not records:
+        return
+    with st.expander("Saved test history", expanded=False):
+        history = pd.DataFrame([
+            {
+                "Run ID": record["run_id"],
+                "Saved at (UTC)": record["created_at"],
+                "Test": record["test_type"],
+                "Dataset": record["dataset"],
+                "Result rows": len(record["rows"]),
+                "Errors": len(record.get("errors", [])),
+            }
+            for record in records
+        ])
+        st.dataframe(history, hide_index=True, width="stretch", alt="Saved evaluation test runs")
+        _show_export_buttons(history, "Saved evaluation test history", "evaluation-history")
+        selected_index = st.selectbox(
+            "Open a saved test",
+            range(len(records)),
+            format_func=lambda index: (
+                f"{records[index]['created_at']} · {records[index]['test_type']} · "
+                f"{len(records[index]['rows'])} rows"
+            ),
+            key=f"saved_evaluation_run_{selected_dataset}",
+        )
+        selected = records[selected_index]
+        st.caption("Saved test configuration")
+        st.json(selected.get("configuration", {}))
+        saved_frame = pd.DataFrame(selected["rows"])
+        if not saved_frame.empty:
+            st.dataframe(
+                saved_frame, hide_index=True, width="stretch", alt="Selected saved evaluation results"
+            )
+            _show_export_buttons(
+                saved_frame,
+                f"{selected['test_type']} evaluation · {selected['created_at']}",
+                f"saved-{selected['run_id']}",
+            )
+        else:
+            st.info("This saved test has no result rows.")
+        for error in selected.get("errors", []):
+            st.error(str(error))
 
 
 def _evaluation_rows_for_source() -> list[dict[str, Any]]:
@@ -1022,52 +1141,69 @@ elif workspace == "Evaluation & benchmark":
     st.subheader(":material/query_stats: Evaluation and benchmark")
     st.caption(
         f"{dataset_title} · {len(evaluation_pool):,} of {qa_total:,} QA questions match the corpus; "
-        f"{len(tuning_rows):,} are available for tuning and evaluation."
+        f"{len(tuning_rows):,} are available for tuning and evaluation. Completed runs are saved locally in "
+        "`knowledge_base/runs/evaluations.jsonl`; result tables can be downloaded as CSV or PDF."
     )
 
     if evaluation_view == "Retrieval quality":
         st.markdown("#### Retrieval quality by Top K")
         st.caption("Recall@K and NDCG@K use source labels from qa.jsonl. These metrics measure retrieval, not answer generation.")
         if run_retrieval_eval:
+            st.session_state["retrieval_eval_results"] = []
+            st.session_state["retrieval_eval_errors"] = []
             if not tuning_rows:
                 st.error("No labeled questions match the selected source.")
             else:
                 sample = stratified_sample(tuning_rows, min(eval_sample_size, len(tuning_rows)), seed=42)
                 results = []
+                errors = []
                 progress = st.progress(0, text="Running retrieval evaluation…")
-                for index, store_name in enumerate(eval_store_names):
-                    try:
-                        metrics = _run_retrieval_evaluation(
-                            dataset, store_name, eval_chunk_size, eval_overlap,
-                            sample, eval_top_ks, eval_method, selected_embedding_model,
-                        )
-                        results.append({
-                            "Search backend": store_name, "Retrieval method": eval_method,
-                            "Chunk size": eval_chunk_size, "Overlap": eval_overlap, **metrics,
-                        })
-                    except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                        st.error(f"{store_name}: {error}")
-                    progress.progress((index + 1) / len(eval_store_names), text=f"Evaluated {store_name}")
+                try:
+                    for index, store_name in enumerate(eval_store_names):
+                        try:
+                            metrics = _run_retrieval_evaluation(
+                                dataset, store_name, eval_chunk_size, eval_overlap,
+                                sample, eval_top_ks, eval_method, selected_embedding_model,
+                            )
+                            results.append({
+                                "Search backend": store_name, "Retrieval method": eval_method,
+                                "Chunk size": eval_chunk_size, "Overlap": eval_overlap, **metrics,
+                            })
+                        except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                            errors.append(f"{store_name}: {error}")
+                        progress.progress((index + 1) / len(eval_store_names), text=f"Evaluated {store_name}")
+                finally:
+                    progress.empty()
                 st.session_state["retrieval_eval_results"] = results
-                progress.empty()
+                frame = _retrieval_table(results)
+                st.session_state["retrieval_eval_errors"] = errors
+                _record_evaluation(
+                    "retrieval_quality",
+                    {
+                        "method": eval_method, "stores": eval_store_names,
+                        "chunk_size": eval_chunk_size, "overlap": eval_overlap,
+                        "top_ks": eval_top_ks, "sample_size": len(sample), "seed": 42,
+                    },
+                    frame,
+                    errors,
+                )
         results = st.session_state.get("retrieval_eval_results", [])
         if results:
-            table = []
-            for item in results:
-                row = {key: value for key, value in item.items() if key != "metrics_at_k"}
-                for cutoff, metrics in item["metrics_at_k"].items():
-                    row[f"Recall@{cutoff}"] = metrics["recall"]
-                    row[f"NDCG@{cutoff}"] = metrics["ndcg"]
-                table.append(row)
+            frame = _retrieval_table(results)
             st.dataframe(
-                pd.DataFrame(table), hide_index=True, width="stretch",
+                frame, hide_index=True, width="stretch",
                 alt="Retrieval Recall and NDCG by vector store and Top K",
             )
+            _show_export_buttons(frame, "Retrieval quality results", "retrieval-results")
+        for error in st.session_state.get("retrieval_eval_errors", []):
+            st.error(error)
 
     elif evaluation_view == "Answer accuracy":
         st.markdown("#### Generated answer accuracy")
         st.caption("The judge compares each generated answer with the matching reference answer in qa.jsonl.")
         if run_qa_eval:
+            st.session_state["answer_eval_results"] = []
+            st.session_state["answer_eval_errors"] = []
             if not tuning_rows:
                 st.error("No labeled questions match the selected source.")
             elif _requires_openrouter_key((qa_model, qa_judge_model)) and not api_key:
@@ -1084,6 +1220,7 @@ elif workspace == "Evaluation & benchmark":
                     encoded = [encode_query(embedder, str(row["question"])) for row in sample]
                     for store_name in qa_store_names:
                         verdicts = []
+                        store_error = None
                         try:
                             for row, query_vector in zip(sample, encoded, strict=True):
                                 hits, _ = _get_hits(
@@ -1101,25 +1238,44 @@ elif workspace == "Evaluation & benchmark":
                                 verdicts.append(verdict)
                                 completed += 1
                                 progress.progress(completed / total, text=f"{store_name}: {len(verdicts)}/{len(sample)}")
+                        except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                            store_error = f"{store_name}: {error}"
+                            errors.append(store_error)
+                        if verdicts:
                             results.append({
                                 "Search backend": store_name, "Retrieval method": qa_method,
                                 "Top K": qa_top_k, "Chunk size": qa_chunk_size, "Overlap": qa_overlap,
                                 "QA accuracy": qa_accuracy(verdicts), "Questions judged": len(verdicts),
                                 "Answer model": qa_model, "Judge model": qa_judge_model,
+                                "Error": store_error or "",
                             })
-                        except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                            errors.append(f"{store_name}: {error}")
                     st.session_state["answer_eval_results"] = results
                     st.session_state["answer_eval_errors"] = errors
                 except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                    st.error(f"Answer evaluation failed: {error}")
-                progress.empty()
+                    errors.append(f"Answer evaluation failed: {error}")
+                finally:
+                    progress.empty()
+                st.session_state["answer_eval_results"] = results
+                st.session_state["answer_eval_errors"] = errors
+                _record_evaluation(
+                    "answer_accuracy",
+                    {
+                        "method": qa_method, "stores": qa_store_names, "top_k": qa_top_k,
+                        "chunk_size": qa_chunk_size, "overlap": qa_overlap,
+                        "answer_model": qa_model, "judge_model": qa_judge_model,
+                        "sample_size": len(sample), "seed": 7,
+                    },
+                    pd.DataFrame(results),
+                    errors,
+                )
         results = st.session_state.get("answer_eval_results", [])
         if results:
+            frame = pd.DataFrame(results)
             st.dataframe(
-                pd.DataFrame(results), hide_index=True, width="stretch",
+                frame, hide_index=True, width="stretch",
                 alt="LLM judged answer accuracy across retrieval backends",
             )
+            _show_export_buttons(frame, "Generated answer accuracy results", "answer-accuracy-results")
         for error in st.session_state.get("answer_eval_errors", []):
             st.error(error)
 
@@ -1133,6 +1289,10 @@ elif workspace == "Evaluation & benchmark":
             sample = stratified_sample(
                 tuning_rows, min(benchmark_sample_size, len(tuning_rows)), seed=20261117
             )
+            st.session_state["backend_benchmark_results"] = []
+            results = []
+            errors = []
+            status = st.status("Running vector-store benchmark…", expanded=True)
             try:
                 results = run_hyperparameter_grid(
                     dataset=dataset, store_names=benchmark_stores,
@@ -1144,8 +1304,30 @@ elif workspace == "Evaluation & benchmark":
                     queries=sample, output_dir=KNOWLEDGE_BASE / "runs",
                 )
                 st.session_state["backend_benchmark_results"] = results
+                errors.extend(
+                    f"{result['config']['store_name']}: {result['error']}"
+                    for result in results if result["error"]
+                )
+                status.update(
+                    label="Vector-store benchmark completed with errors." if errors
+                    else "Vector-store benchmark complete.",
+                    state="error" if errors else "complete",
+                    expanded=bool(errors),
+                )
             except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                errors.append(str(error))
                 st.error(f"Vector-store benchmark failed: {error}")
+                status.update(label="Vector-store benchmark failed.", state="error", expanded=True)
+            _record_evaluation(
+                "vector_store_benchmark",
+                {
+                    "stores": benchmark_stores, "top_ks": benchmark_top_ks,
+                    "chunk_size": benchmark_chunk_size, "overlap": benchmark_overlap,
+                    "repeats": benchmark_repeats, "sample_size": len(sample), "seed": 20261117,
+                },
+                _benchmark_table(results),
+                errors,
+            )
         results = st.session_state.get("backend_benchmark_results", [])
         _show_metric_table(
             results, "Vector-store benchmark with resource use and retrieval quality at multiple Top K values"
@@ -1157,6 +1339,10 @@ elif workspace == "Evaluation & benchmark":
         st.caption("Use tuning questions to choose settings. Each record includes its backend and full configuration.")
         if run_tuning and tuning_rows:
             sample = stratified_sample(tuning_rows, min(tuning_sample_size, len(tuning_rows)), seed=20261117)
+            st.session_state["tuning_results"] = []
+            results = []
+            errors = []
+            status = st.status("Running hyperparameter tuning…", expanded=True)
             try:
                 results = run_hyperparameter_grid(
                     dataset=dataset, store_names=tuning_stores,
@@ -1164,11 +1350,37 @@ elif workspace == "Evaluation & benchmark":
                     chunk_sizes=tuning_chunk_sizes, overlaps=tuning_overlaps,
                     top_ks=tuning_top_ks, repeats=tuning_repeats,
                     prepare=lambda size, overlap: _prepare_experiment(size, overlap, selected_embedding_model),
+                    queries=sample,
                     output_dir=KNOWLEDGE_BASE / "runs",
                 )
                 st.session_state["tuning_results"] = results
+                errors.extend(
+                    f"{result['config']['store_name']}: {result['error']}"
+                    for result in results if result["error"]
+                )
+                status.update(
+                    label="Hyperparameter tuning completed with errors." if errors
+                    else "Hyperparameter tuning complete.",
+                    state="error" if errors else "complete",
+                    expanded=bool(errors),
+                )
             except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                errors.append(str(error))
                 st.error(f"Hyperparameter tuning failed: {error}")
+                status.update(label="Hyperparameter tuning failed.", state="error", expanded=True)
+            _record_evaluation(
+                "hyperparameter_tuning",
+                {
+                    "stores": tuning_stores, "chunk_sizes": tuning_chunk_sizes,
+                    "overlaps": tuning_overlaps, "top_ks": tuning_top_ks,
+                    "repeats": tuning_repeats, "sample_size": len(sample), "seed": 20261117,
+                },
+                _benchmark_table(results),
+                errors,
+            )
+        elif run_tuning:
+            st.session_state["tuning_results"] = []
+            st.error("No labeled questions match the selected source.")
         results = st.session_state.get("tuning_results", [])
         _show_metric_table(results, "Hyperparameter tuning results by chunk size, overlap, Top K, and vector store")
         if results:
@@ -1177,37 +1389,61 @@ elif workspace == "Evaluation & benchmark":
     else:
         st.markdown("#### Final holdout comparison")
         st.caption("The reserved split is for the final comparison, after settings are selected on tuning data.")
-        if run_holdout and holdout_rows:
+        if run_holdout:
+            st.session_state["holdout_results"] = []
+            results = []
+            errors = []
+            progress = st.progress(0, text="Preparing final holdout comparison…")
             try:
+                if not holdout_rows:
+                    raise ValueError("No labeled holdout questions match the selected source.")
                 chunks, vectors, query_encoder = _prepare_experiment(
                     holdout_chunk_size, holdout_overlap, selected_embedding_model
                 )
                 sample = stratified_sample(holdout_rows, len(holdout_rows), seed=20261118)
-                results = []
-                progress = st.progress(0, text="Running final comparison…")
                 for index, store_name in enumerate(holdout_stores):
-                    result = benchmark_store(
-                        BenchmarkConfig(
-                            dataset=dataset, store_name=store_name,
-                            embedding_model=embedding_profile(selected_embedding_model)["repo_id"],
-                            chunk_size=holdout_chunk_size, overlap=holdout_overlap,
-                            top_k=max(holdout_top_ks), repeats=1,
-                            evaluation_split="holdout", metric_ks=tuple(holdout_top_ks),
-                        ),
-                        chunks, vectors, sample, query_encoder, KNOWLEDGE_BASE / "runs",
-                    )
-                    results.append(result)
+                    try:
+                        result = benchmark_store(
+                            BenchmarkConfig(
+                                dataset=dataset, store_name=store_name,
+                                embedding_model=embedding_profile(selected_embedding_model)["repo_id"],
+                                chunk_size=holdout_chunk_size, overlap=holdout_overlap,
+                                top_k=max(holdout_top_ks), repeats=1,
+                                evaluation_split="holdout", metric_ks=tuple(holdout_top_ks),
+                            ),
+                            chunks, vectors, sample, query_encoder, KNOWLEDGE_BASE / "runs",
+                        )
+                        results.append(result)
+                        if result["error"]:
+                            errors.append(f"{store_name}: {result['error']}")
+                    except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                        errors.append(f"{store_name}: {error}")
+                        st.error(f"{store_name}: {error}")
                     progress.progress((index + 1) / len(holdout_stores), text=f"Measured {store_name}")
                 st.session_state["holdout_results"] = results
-                progress.empty()
             except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                errors.append(str(error))
                 st.error(f"Final holdout comparison failed: {error}")
+            finally:
+                progress.empty()
+            st.session_state["holdout_results"] = results
+            _record_evaluation(
+                "final_holdout",
+                {
+                    "stores": holdout_stores, "top_ks": holdout_top_ks,
+                    "chunk_size": holdout_chunk_size, "overlap": holdout_overlap,
+                    "sample_size": len(holdout_rows), "seed": 20261118,
+                },
+                _benchmark_table(results),
+                errors,
+            )
         results = st.session_state.get("holdout_results", [])
         _show_metric_table(results, "Final holdout benchmark across vector stores")
         if results and all(result["error"] is None for result in results):
             st.success(f"Compared {len(results)} vector stores on {len(holdout_rows):,} held-out questions.")
         elif results:
             st.warning("At least one backend failed. Resolve that backend before relying on the comparison.")
+    _show_saved_evaluation_history(dataset)
 
 else:
     st.subheader(":material/route: Project guide")
