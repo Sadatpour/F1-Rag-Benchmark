@@ -9,9 +9,36 @@ from f1_rag.model_config import load_model_config, resolve_model_path
 
 
 _MODEL_CONFIG = load_model_config()
-EMBEDDING_MODEL_ID = _MODEL_CONFIG["embedding"]["repo_id"]
-EMBEDDING_MODEL_PATH = resolve_model_path(_MODEL_CONFIG["embedding"]["local_path"])
-EMBEDDING_WEIGHTS_PATH = resolve_model_path(_MODEL_CONFIG["embedding"]["weights_path"])
+_EMBEDDING_CONFIG = _MODEL_CONFIG["embedding"]
+_PROFILE_ROWS = _EMBEDDING_CONFIG.get("models") or {
+    _EMBEDDING_CONFIG["repo_id"]: {
+        "repo_id": _EMBEDDING_CONFIG["repo_id"],
+        "local_path": _EMBEDDING_CONFIG["local_path"],
+        "weights_path": _EMBEDDING_CONFIG["weights_path"],
+    }
+}
+EMBEDDING_PROFILES: dict[str, dict[str, Any]] = {
+    str(name): {
+        "repo_id": str(row["repo_id"]),
+        "local_path": resolve_model_path(str(row["local_path"])),
+        "weights_path": resolve_model_path(str(row.get("weights_path") or ".")),
+    }
+    for name, row in _PROFILE_ROWS.items()
+}
+DEFAULT_EMBEDDING_MODEL = str(_EMBEDDING_CONFIG.get("default_model", next(iter(EMBEDDING_PROFILES))))
+if DEFAULT_EMBEDDING_MODEL not in EMBEDDING_PROFILES:
+    raise ValueError(f"Default embedding model {DEFAULT_EMBEDDING_MODEL!r} is not registered.")
+EMBEDDING_MODEL_ID = EMBEDDING_PROFILES[DEFAULT_EMBEDDING_MODEL]["repo_id"]
+EMBEDDING_MODEL_PATH = EMBEDDING_PROFILES[DEFAULT_EMBEDDING_MODEL]["local_path"]
+EMBEDDING_WEIGHTS_PATH = EMBEDDING_PROFILES[DEFAULT_EMBEDDING_MODEL]["weights_path"]
+
+
+def embedding_profile(name: str | None = None) -> dict[str, Any]:
+    selected = name or DEFAULT_EMBEDDING_MODEL
+    try:
+        return EMBEDDING_PROFILES[selected]
+    except KeyError as error:
+        raise ValueError(f"Embedding model {selected!r} is not configured.") from error
 
 
 class MeanPoolingEncoder:

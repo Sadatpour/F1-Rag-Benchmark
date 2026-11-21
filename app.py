@@ -22,9 +22,9 @@ LOGGER = logging.getLogger(__name__)
 sys.path.insert(0, str(ROOT / "src"))
 
 from f1_rag.embeddings import (
-    EMBEDDING_MODEL_ID,
-    EMBEDDING_MODEL_PATH,
-    EMBEDDING_WEIGHTS_PATH,
+    DEFAULT_EMBEDDING_MODEL,
+    EMBEDDING_PROFILES,
+    embedding_profile,
     load_embedding_model,
 )
 from f1_rag.evaluation import ndcg_at_n, qa_accuracy, recall_at_n, stratified_sample
@@ -41,7 +41,15 @@ from f1_rag.openrouter import (
     get_api_key,
     judge_answer,
     list_models,
-    rewrite_query,
+    rewrite_query_safely,
+)
+from f1_rag.reranking import (
+    DEFAULT_RERANKER_MODEL,
+    RERANKER_CANDIDATE_COUNT,
+    RERANKER_PROFILES,
+    load_reranker,
+    rerank_candidates,
+    reranker_profile,
 )
 from f1_rag.retrieval import embed_documents, encode_query, load_evaluation_rows, prepare_index
 from f1_rag.sources import (
@@ -60,6 +68,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Apply the updated Ask defaults once per browser session. This also updates
+# sessions that already had the previous widget values, without overriding
+# later user selections on every Streamlit rerun.
+if st.session_state.get("_ask_defaults_version") != 2:
+    st.session_state["ask_vector_stores"] = ["NumPy (exact)", "FAISS", "ChromaDB"]
+    st.session_state["ask_retrieval_method"] = "Hybrid"
+    st.session_state["ask_top_k"] = 3
+    st.session_state["_ask_defaults_version"] = 2
 
 st.html(
     """
@@ -125,27 +142,62 @@ def embedding_model(
     return load_embedding_model(model_id, Path(model_path), Path(weights_path))
 
 
-def embedding_signature() -> tuple[str, str, str, int, int]:
+def embedding_signature(model_name: str = DEFAULT_EMBEDDING_MODEL) -> tuple[str, str, str, int, int]:
+    profile = embedding_profile(model_name)
+    weights_path = profile["weights_path"]
     try:
-        stat = EMBEDDING_WEIGHTS_PATH.stat()
+        stat = weights_path.stat()
         size, modified = stat.st_size, stat.st_mtime_ns
     except FileNotFoundError:
         size, modified = 0, 0
     return (
-        EMBEDDING_MODEL_ID,
-        str(EMBEDDING_MODEL_PATH),
-        str(EMBEDDING_WEIGHTS_PATH),
+        profile["repo_id"],
+        str(profile["local_path"]),
+        str(weights_path),
         size,
         modified,
     )
 
 
+@st.cache_resource(show_spinner=False, max_entries=3)
+def reranker_model(
+    model_name: str,
+    model_path: str,
+    max_length: int,
+    weights_size: int,
+    weights_mtime: int,
+) -> Any:
+    del model_path, max_length, weights_size, weights_mtime
+    return load_reranker(model_name)
+
+
+def load_selected_reranker(model_name: str) -> Any:
+    profile = reranker_profile(model_name)
+    weights_path = profile["local_path"] / "model.safetensors"
+    stat = weights_path.stat()
+    return reranker_model(
+        model_name,
+        str(profile["local_path"]),
+        profile["max_length"],
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+
+
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
-def model_catalog() -> tuple[dict[str, dict[str, Any]], str | None]:
+def model_catalog(api_key_configured: bool) -> tuple[dict[str, dict[str, Any]], str | None]:
+    if not api_key_configured:
+        return {}, None
     try:
         return list_models(), None
     except (RuntimeError, TimeoutError, HTTPException, OSError) as error:
-        return {}, str(error)
+        message = str(error)
+        if "HTTP 403" in message and "security policy" in message.lower():
+            message = (
+                "OpenRouter blocked the model-catalog request (HTTP 403). Configured models remain available. "
+                "Check the API key's IP allowlist in OpenRouter Security settings."
+            )
+        return {}, message
 
 
 @st.cache_data(show_spinner=False, max_entries=1)
@@ -233,6 +285,9 @@ def indexed_corpus(
             corpus_mtime,
             corpus_document_count,
         ),
+        embedding_model_id=model_id,
+        embedding_model_path=Path(model_path),
+        embedding_weights_path=Path(weights_path),
     )
 
 
@@ -272,13 +327,16 @@ def _corpus_sources(dataset: str) -> set[str]:
     return sources
 
 
-def _ready_index(dataset: str, store_name: str, chunk_size: int, overlap: int) -> tuple[Any, int, bool]:
+def _ready_index(
+    dataset: str, store_name: str, chunk_size: int, overlap: int,
+    model_name: str = DEFAULT_EMBEDDING_MODEL,
+) -> tuple[Any, int, bool]:
     path = resolve_corpus_path(dataset)
     stat = path.stat()
     return indexed_corpus(
         dataset,
         store_name,
-        *embedding_signature(),
+        *embedding_signature(model_name),
         chunk_size,
         overlap,
         stat.st_size,
@@ -326,27 +384,29 @@ def _get_hits(
     count: int,
     query_text: str = "",
     retrieval_method: str = "Dense",
+    model_name: str = DEFAULT_EMBEDDING_MODEL,
 ) -> tuple[list[dict[str, Any]], int]:
     if retrieval_method in {"BM25", "Hybrid"}:
         corpus_path = resolve_corpus_path(dataset)
         corpus_stat = corpus_path.stat()
         sparse = sparse_index(
             dataset,
-            *embedding_signature(),
+            *embedding_signature(model_name),
             chunk_size,
             overlap,
             corpus_stat.st_size,
             corpus_stat.st_mtime_ns,
             corpus_total,
         )
-        candidate_count = min(max(count * 3, count), len(sparse.documents))
+        requested_candidates = max(count * 3, count) if retrieval_method == "Hybrid" else count
+        candidate_count = min(requested_candidates, len(sparse.documents))
         sparse_hits = sparse.search(query_text, candidate_count)
         if retrieval_method == "BM25":
             return sparse_hits, len(sparse.documents)
-        dense_store, _, _ = _ready_index(dataset, store_name, chunk_size, overlap)
+        dense_store, _, _ = _ready_index(dataset, store_name, chunk_size, overlap, model_name)
         dense_hits = dense_store.search(query_vector, candidate_count)
         return hybrid_search(dense_hits, sparse_hits, count), len(sparse.documents)
-    store, chunk_count, _ = _ready_index(dataset, store_name, chunk_size, overlap)
+    store, chunk_count, _ = _ready_index(dataset, store_name, chunk_size, overlap, model_name)
     return store.search(query_vector, count), chunk_count
 
 
@@ -356,11 +416,16 @@ def _run_retrieval_evaluation(
     chunk_size: int,
     overlap: int,
     rows: list[dict[str, Any]],
+    top_ks: list[int],
     retrieval_method: str = "Dense",
-) -> dict[str, float | int]:
-    embedder = embedding_model(*embedding_signature())
-    recalls = []
-    ndcgs = []
+    model_name: str = DEFAULT_EMBEDDING_MODEL,
+) -> dict[str, Any]:
+    embedder = embedding_model(*embedding_signature(model_name))
+    cutoffs = sorted(set(top_ks))
+    if not cutoffs or cutoffs[0] < 1:
+        raise ValueError("Select at least one Top K value greater than zero.")
+    recalls = {cutoff: [] for cutoff in cutoffs}
+    ndcgs = {cutoff: [] for cutoff in cutoffs}
     for row in rows:
         query = encode_query(embedder, str(row["question"]))
         hits, _ = _get_hits(
@@ -369,17 +434,24 @@ def _run_retrieval_evaluation(
             chunk_size,
             overlap,
             query,
-            10,
+            max(cutoffs),
             str(row["question"]),
             retrieval_method,
+            model_name,
         )
         relevant = {str(row["source"])} if row.get("source") else set()
-        recalls.append(recall_at_n(hits, relevant, 10))
-        ndcgs.append(ndcg_at_n(hits, relevant, 10))
+        for cutoff in cutoffs:
+            recalls[cutoff].append(recall_at_n(hits, relevant, cutoff))
+            ndcgs[cutoff].append(ndcg_at_n(hits, relevant, cutoff))
     return {
         "questions": len(rows),
-        "recall@10": sum(recalls) / len(recalls) if recalls else 0.0,
-        "ndcg@10": sum(ndcgs) / len(ndcgs) if ndcgs else 0.0,
+        "metrics_at_k": {
+            cutoff: {
+                "recall": sum(recalls[cutoff]) / len(recalls[cutoff]) if recalls[cutoff] else 0.0,
+                "ndcg": sum(ndcgs[cutoff]) / len(ndcgs[cutoff]) if ndcgs[cutoff] else 0.0,
+            }
+            for cutoff in cutoffs
+        },
     }
 
 
@@ -446,7 +518,7 @@ except ValueError as error:
     api_key = ""
     api_key_error = str(error)
 
-model_info, catalog_error = model_catalog()
+model_info, catalog_error = model_catalog(bool(api_key))
 model_options = list(
     dict.fromkeys(
         (
@@ -464,100 +536,227 @@ model_options = list(
 with st.sidebar:
     st.markdown("## :material/speed: Apex RAG")
     st.caption("F1 knowledge lab")
-
-    st.markdown("**Knowledge source**")
     dataset_title = st.selectbox("Knowledge source", ("Wikipedia", "Jolpica"), index=0)
     dataset = dataset_title.lower()
-    st.markdown("**Retrieval setup**")
-    vector_stores = st.multiselect(
-        "Vector store / index backends",
-        ("NumPy (exact)", "FAISS", "ChromaDB"),
-        default=["NumPy (exact)"],
-        help=(
-            "Choose where dense vectors are indexed: NumPy is the local exact-search baseline, "
-            "FAISS is a similarity-search library, and ChromaDB is a vector database."
-        ),
+    embedding_options = list(EMBEDDING_PROFILES)
+    selected_embedding_model = st.selectbox(
+        "Embedding model",
+        embedding_options,
+        index=embedding_options.index(DEFAULT_EMBEDDING_MODEL),
+        key="embedding_model_choice",
+        help="This model converts both corpus chunks and questions to vectors. Add profiles in config/models.toml.",
     )
-    retrieval_method = st.selectbox(
-        "Retrieval method",
-        ("Dense", "Hybrid", "BM25"),
-        help=(
-            "Dense searches each selected vector backend. Hybrid combines each selected backend's dense results "
-            "with BM25 using RRF. BM25 searches words and runs as one standalone result."
-        ),
+    workspace = st.radio(
+        "Workspace",
+        ("Ask", "Evaluation & benchmark", "Project guide"),
+        key="workspace_page",
     )
-    store_names = ["BM25"] if retrieval_method == "BM25" else list(vector_stores)
-    if retrieval_method == "BM25":
-        st.caption("BM25 is independent of the selected vector databases and produces one result column.")
-    st.markdown("**Answer models**")
-    selected_models = st.multiselect(
-        "Answer models",
-        model_options,
-        default=["rotation::answer"] if "rotation::answer" in model_options else [],
-        help="A model is queried once per selected vector store.",
-        format_func=_model_label,
-    )
-    top_k = st.slider("Retrieved context count", min_value=1, max_value=10, value=5)
 
-    with st.expander("Advanced settings", expanded=False):
-        judge_enabled = st.toggle(
-            "Use judge model",
-            value=True,
-            help="Turn this off to skip judge calls in answer comparisons and QA accuracy runs.",
+    if workspace == "Ask":
+        st.markdown("**Retrieval setup**")
+        vector_stores = st.multiselect(
+            "Vector store / index backends",
+            ("NumPy (exact)", "FAISS", "ChromaDB"),
+            key="ask_vector_stores",
+            help="Each selected backend gets its own answer column.",
         )
+        retrieval_method = st.selectbox(
+            "Retrieval method", ("Dense", "Hybrid", "BM25"), key="ask_retrieval_method",
+            help="Dense uses vectors; BM25 uses keywords; Hybrid combines both rankings.",
+        )
+        store_names = ["BM25"] if retrieval_method == "BM25" else list(vector_stores)
+        if retrieval_method == "BM25":
+            st.caption("BM25 runs alone; vector-store selections do not apply.")
+        selected_models = st.multiselect(
+            "Answer models", model_options,
+            default=["rotation::answer"] if "rotation::answer" in model_options else [],
+            key="ask_answer_models", format_func=_model_label,
+        )
+        top_k = st.selectbox("Retrieved chunks (Top K)", (1, 3, 5), key="ask_top_k")
+        chunk_size = st.select_slider("Chunk size (tokens)", (128, 192, 224), value=192, key="ask_chunk_size")
+        overlap = st.select_slider("Chunk overlap (tokens)", (0, 16, 32, 48), value=32, key="ask_overlap")
+        st.markdown("**Advanced settings**")
+        reranking_enabled = st.toggle(
+            "Enable reranking",
+            value=False,
+            key="ask_reranking_enabled",
+            help="The configured MS MARCO CrossEncoder is English-focused. Enable query rewrite for Persian questions.",
+        )
+        reranker_options = list(RERANKER_PROFILES)
+        reranker_name = st.selectbox(
+            "Reranker model",
+            reranker_options,
+            index=reranker_options.index(DEFAULT_RERANKER_MODEL) if DEFAULT_RERANKER_MODEL in reranker_options else 0,
+            key="ask_reranker_model",
+        ) if reranker_options else ""
+        reranker_candidate_count = st.select_slider(
+            "Candidate chunks before reranking",
+            (10, 20, 30, 50),
+            value=RERANKER_CANDIDATE_COUNT if RERANKER_CANDIDATE_COUNT in (10, 20, 30, 50) else 30,
+            key="ask_reranker_candidates",
+            disabled=not reranking_enabled,
+            help="Retrieve this many candidates first. The reranker then selects the final Top K chunks.",
+        )
+        judge_enabled = st.toggle("Judge against retrieved evidence", value=True, key="ask_judge_enabled")
         judge_model = st.selectbox(
-            "Judge model",
-            model_options,
+            "Judge model", model_options,
             index=model_options.index(DEFAULT_JUDGE_MODEL) if DEFAULT_JUDGE_MODEL in model_options else 0,
-            disabled=not judge_enabled,
-            format_func=_model_label,
+            key="ask_judge_model", disabled=not judge_enabled, format_func=_model_label,
         )
-        rewrite_enabled = st.toggle("Rewrite query before embedding", value=False)
+        rewrite_enabled = st.toggle("Rewrite query before search", value=False, key="ask_rewrite_enabled")
         rewrite_model = st.selectbox(
-            "Query-rewrite model",
-            model_options,
+            "Query rewrite model", model_options,
             index=model_options.index(DEFAULT_REWRITE_MODEL) if DEFAULT_REWRITE_MODEL in model_options else 0,
-            disabled=not rewrite_enabled,
-            format_func=_model_label,
+            key="ask_rewrite_model", disabled=not rewrite_enabled, format_func=_model_label,
         )
-        chunk_size = st.select_slider(
-            "Chunk size (embedding tokens)",
-            options=(128, 192, 224),
-            value=192,
-            help="Tokenized with the embedding model tokenizer; each chunk stays within its 256-token input limit.",
+    elif workspace == "Evaluation & benchmark":
+        evaluation_view = st.radio(
+            "Evaluation mode",
+            ("Retrieval quality", "Answer accuracy", "Vector-store benchmark", "Hyperparameter tuning", "Final holdout"),
+            key="evaluation_mode",
         )
-        overlap = st.select_slider("Chunk overlap (tokens)", options=(0, 16, 32, 48), value=32)
-        if overlap >= chunk_size:
-            st.error("Overlap must be smaller than the selected chunk size.")
-        st.markdown("**Model context windows**")
-        context_models = (
-            *selected_models,
-            *((judge_model,) if judge_enabled else ()),
-            *((rewrite_model,) if rewrite_enabled else ()),
-        )
-        for model in dict.fromkeys(context_models):
-            context = _context_window(model)
-            context_label = f"{int(context):,} tokens" if isinstance(context, (int, float)) else "not listed"
-            st.caption(f"`{model}` · {context_label}")
-        st.caption(f"Embedding: `{EMBEDDING_MODEL_ID}`")
-    if api_key_error and _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))):
-        st.error(api_key_error)
-    elif not api_key and _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))):
-        st.warning("Set `OPENROUTER_API_KEY` in the environment or project `.env` file.")
-    elif not api_key:
-        st.caption("Direct provider keys are read from their matching environment variables.")
-    if catalog_error:
-        st.caption(f"Live model catalog unavailable; showing configured defaults. {catalog_error}")
+        vector_store_options = ("NumPy (exact)", "FAISS", "ChromaDB")
+        method_options = ("Dense", "Hybrid", "BM25")
+
+        if evaluation_view == "Retrieval quality":
+            eval_method = st.selectbox("Retrieval method", method_options, key="eval_method")
+            eval_stores = st.multiselect(
+                "Vector stores", vector_store_options, default=["NumPy (exact)"],
+                key="eval_stores", disabled=eval_method == "BM25",
+            )
+            eval_store_names = ["BM25"] if eval_method == "BM25" else eval_stores
+            eval_top_ks = st.pills(
+                "Top K cutoffs", (1, 3, 5), default=[1, 3, 5], selection_mode="multi", key="eval_top_ks"
+            ) or []
+            eval_chunk_size = st.selectbox("Chunk size (tokens)", (128, 192, 224), index=1, key="eval_chunk")
+            eval_overlap = st.selectbox("Overlap (tokens)", (0, 16, 32, 48), index=2, key="eval_overlap")
+            eval_sample_size = st.slider("Tuning questions", 10, 100, 30, step=10, key="eval_sample_size")
+            st.caption("Metrics use the matched source labels in qa.jsonl.")
+            run_retrieval_eval = st.button(
+                "Run retrieval evaluation", type="primary", width="stretch",
+                disabled=not eval_store_names or not eval_top_ks or eval_overlap >= eval_chunk_size,
+                key="run_retrieval_eval",
+            )
+        elif evaluation_view == "Answer accuracy":
+            qa_method = st.selectbox("Retrieval method", method_options, key="qa_method")
+            qa_stores = st.multiselect(
+                "Vector stores", vector_store_options, default=["NumPy (exact)"],
+                key="qa_stores", disabled=qa_method == "BM25",
+            )
+            qa_store_names = ["BM25"] if qa_method == "BM25" else qa_stores
+            qa_top_k = st.selectbox("Retrieved chunks (Top K)", (1, 3, 5), index=2, key="qa_top_k")
+            qa_chunk_size = st.selectbox("Chunk size (tokens)", (128, 192, 224), index=1, key="qa_chunk")
+            qa_overlap = st.selectbox("Overlap (tokens)", (0, 16, 32, 48), index=2, key="qa_overlap")
+            qa_model = st.selectbox("Answer model", model_options, key="qa_answer_model", format_func=_model_label)
+            qa_judge_model = st.selectbox(
+                "Judge model", model_options,
+                index=model_options.index(DEFAULT_JUDGE_MODEL) if DEFAULT_JUDGE_MODEL in model_options else 0,
+                key="qa_judge_model", format_func=_model_label,
+            )
+            qa_sample_size = st.slider("Tuning questions", 10, 100, 30, step=10, key="qa_sample_size")
+            st.caption("One answer call and one judge call run per question and backend.")
+            run_qa_eval = st.button(
+                "Run answer evaluation", type="primary", width="stretch",
+                disabled=not qa_store_names or qa_overlap >= qa_chunk_size, key="run_qa_eval",
+            )
+        elif evaluation_view == "Vector-store benchmark":
+            benchmark_stores = st.multiselect(
+                "Vector stores to compare", vector_store_options, default=list(vector_store_options),
+                key="benchmark_stores",
+            )
+            benchmark_top_ks = st.pills(
+                "Top K cutoffs", (1, 3, 5), default=[1, 3, 5], selection_mode="multi",
+                key="benchmark_top_ks",
+            ) or []
+            benchmark_chunk_size = st.selectbox("Chunk size (tokens)", (128, 192, 224), index=1, key="benchmark_chunk")
+            benchmark_overlap = st.selectbox("Overlap (tokens)", (0, 16, 32, 48), index=2, key="benchmark_overlap")
+            benchmark_repeats = st.slider("Repeated runs", 3, 10, 5, key="benchmark_repeats")
+            benchmark_sample_size = st.slider("Tuning questions", 10, 100, 30, step=10, key="benchmark_sample_size")
+            st.caption("Measures index build, search latency, RAM, CPU, Recall@K, and NDCG@K.")
+            run_backend_benchmark = st.button(
+                "Run vector-store benchmark", type="primary", width="stretch",
+                disabled=not benchmark_stores or not benchmark_top_ks or benchmark_overlap >= benchmark_chunk_size,
+                key="run_backend_benchmark",
+            )
+        elif evaluation_view == "Hyperparameter tuning":
+            tuning_stores = st.multiselect(
+                "Vector stores", vector_store_options, default=["NumPy (exact)"], key="tuning_stores"
+            )
+            tuning_chunk_sizes = st.multiselect(
+                "Chunk sizes (tokens)", (128, 192, 224), default=[128, 192, 224], key="tuning_chunk_sizes"
+            )
+            tuning_overlaps = st.multiselect(
+                "Overlaps (tokens)", (0, 16, 32, 48), default=[0, 16, 32], key="tuning_overlaps"
+            )
+            tuning_top_ks = st.multiselect(
+                "Top K values", (1, 3, 5), default=[1, 3, 5], key="tuning_top_ks"
+            )
+            tuning_repeats = st.slider("Runs per setting", 3, 10, 5, key="tuning_repeats")
+            tuning_sample_size = st.slider("Tuning questions", 10, 100, 30, step=10, key="tuning_sample_size")
+            valid_tuning_overlap = any(
+                overlap_value < size for size in tuning_chunk_sizes for overlap_value in tuning_overlaps
+            )
+            tuning_run_count = (
+                len(tuning_stores) * len(tuning_chunk_sizes) * len(tuning_overlaps)
+                * len(tuning_top_ks) * tuning_repeats
+            )
+            st.caption(f"Estimated index builds: {tuning_run_count:,}; invalid pairs are skipped.")
+            run_tuning = st.button(
+                "Run hyperparameter tuning", type="primary", width="stretch",
+                disabled=not all((tuning_stores, tuning_chunk_sizes, tuning_overlaps, tuning_top_ks, valid_tuning_overlap)),
+                key="run_tuning",
+            )
+        else:
+            holdout_stores = st.multiselect(
+                "Vector stores for final comparison", vector_store_options,
+                default=list(vector_store_options), key="holdout_stores",
+            )
+            holdout_top_ks = st.pills(
+                "Top K cutoffs", (1, 3, 5), default=[1, 3, 5], selection_mode="multi",
+                key="holdout_top_ks",
+            ) or []
+            holdout_chunk_size = st.selectbox("Chunk size (tokens)", (128, 192, 224), index=1, key="holdout_chunk")
+            holdout_overlap = st.selectbox("Overlap (tokens)", (0, 16, 32, 48), index=2, key="holdout_overlap")
+            st.caption("Uses reserved holdout questions after tuning is complete.")
+            run_log = KNOWLEDGE_BASE / "runs" / "runs.jsonl"
+            prior_holdout = False
+            if run_log.is_file():
+                try:
+                    prior_holdout = any(
+                        (saved_run := json.loads(line)).get("config", {}).get("dataset") == dataset
+                        and saved_run.get("config", {}).get("evaluation_split") == "holdout"
+                        and saved_run.get("error") is None
+                        for line in run_log.read_text(encoding="utf-8").splitlines()
+                    )
+                except (OSError, json.JSONDecodeError):
+                    st.warning("Could not read the run history; holdout protection is unavailable.")
+            if prior_holdout:
+                st.info("A successful holdout run already exists for this source. Review it below.")
+            run_holdout = st.button(
+                "Run final holdout once", type="primary", width="stretch",
+                disabled=(not holdout_stores or not holdout_top_ks or prior_holdout or holdout_overlap >= holdout_chunk_size),
+                key="run_holdout",
+            )
+    else:
+        run_retrieval_eval = run_qa_eval = run_backend_benchmark = run_tuning = run_holdout = False
+
+if api_key_error and workspace == "Ask" and _requires_openrouter_key(
+    (*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))
+):
+    st.sidebar.error(api_key_error)
+elif not api_key and workspace == "Ask" and _requires_openrouter_key(
+    (*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))
+):
+    st.sidebar.warning("Set `OPENROUTER_API_KEY` in the environment or the project `.env` file.")
+elif not api_key:
+    st.sidebar.caption("Direct provider keys are read from their environment variables.")
+if catalog_error:
+    st.sidebar.caption(f"Live model catalog unavailable; showing configured defaults. {catalog_error}")
 
 manifest_path = KNOWLEDGE_BASE / "manifest.json"
 if not manifest_path.is_file():
-    st.error(
-        "The independent knowledge base is missing. Restore the original "
-        "`data/raw/wikipedia`, `data/raw/jolpica`, and `data/final/qa.jsonl` inputs, "
-        "then run `python -m f1_rag.ingest`."
-    )
+    st.error("The knowledge base is missing. Restore its source and evaluation inputs, then run `python -m f1_rag.ingest`.")
     st.stop()
-
 try:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     corpus_total = manifest["documents"][dataset]
@@ -566,649 +765,469 @@ except (OSError, KeyError, ValueError) as error:
     st.error(f"The knowledge-base manifest is invalid: {error}")
     st.stop()
 
-if dataset == "jolpica":
-    st.info(
-        f"Data source: [{JOLPICA_ATTRIBUTION}]({JOLPICA_API_BASE}/). "
-        "Retrieved records link to their corresponding API endpoints."
-    )
 
-work_column, metrics_rail = st.columns([4.2, 1], gap="large", vertical_alignment="top")
-with work_column:
-    st.subheader(":material/travel_explore: Ask the F1 knowledge base")
-    st.caption("Ask once, then compare how each retrieval setup supports the answer with evidence.")
-    with st.form("query_form", clear_on_submit=False, border=True):
-        question = st.text_area(
-            "Question",
-            placeholder="Who won the 1976 Formula One World Championship?",
-            height=90,
-            label_visibility="collapsed",
-        )
-        submitted = st.form_submit_button("Retrieve & compare", type="primary", width="stretch")
-    query_tab, eval_tab, experiments_tab, about_tab = st.tabs(
-        (
-            ":material/search: Compare answers",
-            ":material/query_stats: Evaluation",
-            ":material/query_stats: Benchmarks",
-            ":material/folder: Project guide",
-        )
-    )
-with metrics_rail:
-    st.markdown("**SESSION SNAPSHOT**")
-    st.metric("Selected source", dataset_title, border=True)
-    st.metric("Source documents", f"{corpus_total:,}", border=True)
-    st.metric("Evaluation Q&A", f"{qa_total:,}", border=True)
-    st.metric("Chunk / overlap", f"{chunk_size} / {overlap}", border=True)
-
-with query_tab:
-    if submitted:
-        if not question.strip():
-            st.error("Enter a question before running the comparison.")
-        elif not store_names:
-            st.error("Select at least one vector store.")
-        elif not selected_models:
-            st.error("Select at least one answer model.")
-        elif overlap >= chunk_size:
-            st.error("Chunk overlap must be smaller than chunk size.")
-        elif _requires_openrouter_key((*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))) and not api_key:
-            st.error("Configure the OpenRouter key for the selected model or auxiliary model.")
-        else:
-            payload: dict[str, Any] = {
-                "question": question.strip(),
-                "query": question.strip(),
-                "stores": list(store_names),
-                "models": list(selected_models),
-                "retrieval_method": retrieval_method,
-                "hits": {},
-                "answers": {},
-                "errors": {},
-                "chunks": {},
-            }
-            try:
-                if rewrite_enabled:
-                    with st.spinner("Rewriting the search query…"):
-                        payload["query"] = rewrite_query(
-                            question.strip(),
-                            rewrite_model,
-                            corpus_preview(dataset),
-                            api_key,
-                        )
-                with st.spinner("Loading the embedding model…"):
-                    embedder = embedding_model(*embedding_signature())
-                query_vector = encode_query(embedder, payload["query"])
-            except (RuntimeError, ValueError, OSError) as error:
-                LOGGER.exception("Failed to load the embedding model or encode the query.")
-                payload["errors"]["retrieval"] = str(error)
-                query_vector = None
-
-            if query_vector is not None:
-                for store_name in store_names:
-                    try:
-                        with st.spinner(f"Searching {store_name}… (first run builds its index)"):
-                            hits, count = _get_hits(
-                                dataset,
-                                store_name,
-                                chunk_size,
-                                overlap,
-                                query_vector,
-                                top_k,
-                                payload["query"],
-                                retrieval_method,
-                            )
-                        payload["hits"][store_name] = hits
-                        payload["chunks"][store_name] = count
-                    except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                        payload["errors"][store_name] = str(error)
-
-                for store_name, hits in payload["hits"].items():
-                    for model in selected_models:
-                        key = f"{store_name}::{model}"
-                        try:
-                            with st.spinner(f"{model} · {store_name}…"):
-                                context = _context_window(model)
-                                response = answer_question(
-                                    payload["question"],
-                                    hits,
-                                    model,
-                                    api_key,
-                                    context_length=context if isinstance(context, int) else None,
-                                )
-                            payload["answers"][key] = {"text": response, "judge": None}
-                        except (RuntimeError, ValueError) as error:
-                            payload["errors"][key] = str(error)
-                            continue
-
-                        if judge_enabled:
-                            try:
-                                with st.spinner(f"Judging {model} · {store_name}…"):
-                                    verdict = judge_answer(
-                                        payload["question"],
-                                        "\n\n".join(
-                                            f"Source: {hit.get('source', 'unknown')}\n"
-                                            f"Source URL: {hit.get('source_url', '')}\n"
-                                            f"{hit.get('text', '')}"
-                                            for hit in hits
-                                        ),
-                                        response,
-                                        judge_model,
-                                        api_key,
-                                    )
-                                payload["answers"][key]["judge"] = verdict
-                            except (RuntimeError, ValueError) as error:
-                                payload["errors"][f"{key} judge"] = str(error)
-            st.session_state["last_comparison"] = payload
-
-    payload = st.session_state.get("last_comparison")
-    if payload:
-        displayed_stores = payload.get("stores", list(payload["hits"]))
-        displayed_models = payload.get("models", selected_models)
-        displayed_method = payload.get("retrieval_method", "Dense")
-        st.markdown(f"**Question:** {payload['question']}")
-        st.caption(f"Retrieval method: {displayed_method}")
-        if payload["query"] != payload["question"]:
-            st.caption(f"Rewritten retrieval query: {payload['query']}")
-        if payload["errors"].get("retrieval"):
-            st.error(payload["errors"]["retrieval"])
-        if not displayed_stores:
-            st.info("No retrieval setup was included in this comparison.")
-        else:
-            store_columns = st.columns(len(displayed_stores))
-            for column, store_name in zip(store_columns, displayed_stores):
-                with column:
-                    st.markdown(f"### {store_name}")
-                    store_hits = payload["hits"].get(store_name, [])
-                    if store_name in payload["chunks"]:
-                        st.caption(
-                            f"{payload['chunks'][store_name]:,} chunks · top {len(store_hits)} results"
-                        )
-                    elif store_name in payload["errors"]:
-                        st.error(f"Search failed: {payload['errors'][store_name]}")
-                    elif payload["errors"].get("retrieval"):
-                        st.info("Search did not run because query preparation failed.")
-                    else:
-                        st.info("No search results were returned for this database.")
-
-                    for model in displayed_models:
-                        key = f"{store_name}::{model}"
-                        st.markdown(f"**{_model_label(model)}**")
-                        result = payload["answers"].get(key)
-                        if result:
-                            st.write(result["text"])
-                            _render_source_citations(store_hits)
-                            verdict = result["judge"]
-                            if verdict:
-                                st.badge(
-                                    "Correct" if verdict["correct"] else "Needs review",
-                                    icon=":material/check_circle:" if verdict["correct"] else ":material/warning:",
-                                    color="green" if verdict["correct"] else "orange",
-                                )
-                                st.caption(f"Judge note: {verdict['reason']}")
-                        elif key in payload["errors"]:
-                            st.error(f"Answer failed: {payload['errors'][key]}")
-                        elif store_hits:
-                            st.info("No answer was generated for this model.")
-
-                    if store_hits:
-                        with st.expander(f"Retrieved evidence · {store_name}"):
-                            for rank, hit in enumerate(store_hits, start=1):
-                                st.markdown(
-                                    f"**[{rank}] {hit.get('source', 'Unknown source')}** · "
-                                    f"score `{hit.get('score', 0):.3f}`"
-                                )
-                                source_url = hit.get("source_url")
-                                if source_url and source_url.startswith(JOLPICA_API_BASE + "/"):
-                                    st.markdown(f"[View {JOLPICA_ATTRIBUTION} record]({source_url})")
-                                elif hit.get("source", "").startswith("Wikipedia:"):
-                                    wikipedia_url = (
-                                        source_url
-                                        if source_url and source_url.startswith(WIKIPEDIA_ARTICLE_BASE)
-                                        else wikipedia_source_url(
-                                            str(hit["source"]).removeprefix("Wikipedia:")
-                                        )
-                                    )
-                                    st.markdown(f"[View Wikipedia article]({wikipedia_url})")
-                                st.write(hit.get("text", ""))
-                                if rank < len(store_hits):
-                                    st.divider()
-
-        for key, message in payload["errors"].items():
-            if key == "retrieval" or key.endswith(" judge"):
-                if key.endswith(" judge") and not judge_enabled:
-                    continue
-                st.caption(f"{key}: {message}")
-
-with eval_tab:
-    st.subheader(":material/query_stats: Retrieval & answer evaluation")
-    st.caption(
-        "Recall@10 and NDCG@10 measure retrieval quality against source labels. QA accuracy measures generated answers "
-        "with an LLM judge. These are different metrics."
-    )
-    eval_pool = _dataset_questions(dataset)
-    total_eval_rows = sum(
-        str(row.get("source", "")).startswith("Wikipedia:") == (dataset == "wikipedia")
-        for row in evaluation_rows()
-    )
-    st.caption(
-        f"QA questions with a matching reference source: **{len(eval_pool):,} / {total_eval_rows:,}** "
-        f"for {dataset_title}"
-    )
-    metric_count = st.slider("Retrieval evaluation sample", min_value=10, max_value=100, value=20, step=10)
-    eval_button = st.button("Run source-match benchmark (top 10)", type="primary", disabled=not store_names)
-    if eval_button:
-        if not eval_pool:
-            st.error(f"No QA rows map to the {dataset_title} corpus.")
-        else:
-            sample = stratified_sample(eval_pool, min(metric_count, len(eval_pool)), seed=42)
-            rows = []
-            progress = st.progress(0, text="Preparing retrieval evaluation…")
-            for index, store_name in enumerate(store_names):
-                try:
-                    result = _run_retrieval_evaluation(
-                        dataset,
-                        store_name,
-                        chunk_size,
-                        overlap,
-                        sample,
-                        retrieval_method,
-                    )
-                    rows.append({"Vector store": store_name, **result})
-                except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                    st.error(f"{store_name}: {error}")
-                progress.progress((index + 1) / len(store_names), text=f"Evaluated {store_name}")
-            st.session_state["retrieval_metrics"] = rows
-            progress.empty()
-
-    metrics = st.session_state.get("retrieval_metrics", [])
-    if metrics:
-        metric_columns = st.columns(len(metrics))
-        for column, result in zip(metric_columns, metrics):
-            with column:
-                st.markdown(f"**{result['Vector store']}**")
-                st.metric("Reference-source hit@10", f"{result['recall@10']:.1%}")
-                st.metric("Distinct-source NDCG@10", f"{result['ndcg@10']:.3f}")
-                st.caption(f"{result['questions']} questions")
-
-    st.space("medium")
-    st.markdown("#### QA accuracy (LLM judge)")
-    if not judge_enabled:
-        st.info("Enable the judge model in the sidebar to run QA accuracy evaluation.")
-    accuracy_count = st.slider("QA accuracy sample size", min_value=10, max_value=100, value=30, step=10)
-    st.caption(
-        "Questions are sampled across entity types. Treat judge results as an estimate for this sample "
-        "and calibrate them with human review."
-    )
-    accuracy_model = st.selectbox("Model to evaluate", selected_models or model_options, key="accuracy_model", format_func=_model_label)
-    accuracy_stores = st.multiselect(
-        "Backends to compare for QA accuracy",
-        store_names,
-        default=list(store_names),
-        key="accuracy_stores",
-    )
-    st.caption(
-        "The same questions, answer model, and judge are used for each selected backend. "
-        "This makes one answer-model call and one judge call per question per backend."
-    )
-    accuracy_button = st.button(
-        "Compare QA accuracy",
-        disabled=(
-            not judge_enabled
-            or (_requires_openrouter_key((accuracy_model, judge_model)) and not api_key)
-            or not accuracy_stores
-        ),
-    )
-    if accuracy_button:
-        if not eval_pool:
-            st.error(f"No QA rows map to the {dataset_title} corpus.")
-        else:
-            sample = stratified_sample(eval_pool, min(accuracy_count, len(eval_pool)), seed=7)
-            accuracy_results = []
-            accuracy_errors = []
-            progress = st.progress(0, text="Comparing QA answers…")
-            total_comparisons = len(sample) * len(accuracy_stores)
-            completed_comparisons = 0
-            try:
-                embedder = embedding_model(*embedding_signature())
-                for accuracy_store in accuracy_stores:
-                    verdicts = []
-                    try:
-                        for row in sample:
-                            query_vector = encode_query(embedder, str(row["question"]))
-                            hits, _ = _get_hits(
-                                dataset,
-                                accuracy_store,
-                                chunk_size,
-                                overlap,
-                                query_vector,
-                                top_k,
-                                str(row["question"]),
-                                retrieval_method,
-                            )
-                            generated = answer_question(
-                                str(row["question"]),
-                                hits,
-                                accuracy_model,
-                                api_key,
-                                context_length=_context_window(accuracy_model),
-                            )
-                            verdict = judge_answer(
-                                str(row["question"]),
-                                str(row.get("answer", "")),
-                                generated,
-                                judge_model,
-                                api_key,
-                            )
-                            verdicts.append({"question": row["question"], **verdict})
-                            completed_comparisons += 1
-                            progress.progress(
-                                completed_comparisons / total_comparisons,
-                                text=f"{accuracy_store}: {len(verdicts)}/{len(sample)} questions",
-                            )
-                        accuracy_results.append(
-                            {
-                                "Backend": accuracy_store,
-                                "QA accuracy": qa_accuracy(verdicts),
-                                "Questions judged": len(verdicts),
-                                "Answer model": accuracy_model,
-                                "Judge model": judge_model,
-                            }
-                        )
-                    except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                        accuracy_errors.append(f"{accuracy_store}: {error}")
-                st.session_state["qa_accuracy_results"] = accuracy_results
-                st.session_state["qa_accuracy_errors"] = accuracy_errors
-            except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                st.error(f"QA accuracy run failed: {error}")
-            progress.empty()
-    accuracy_results = st.session_state.get("qa_accuracy_results", [])
-    if judge_enabled and accuracy_results:
-        st.dataframe(
-            pd.DataFrame(accuracy_results),
-            alt="LLM-judged answer accuracy comparison for selected retrieval backends",
-            hide_index=True,
-            width="stretch",
-        )
-    for error in st.session_state.get("qa_accuracy_errors", []):
-        st.error(error)
-
-with experiments_tab:
-    st.subheader(":material/query_stats: Vector backend benchmarks")
-    st.caption(
-        "A vector backend is the index/storage implementation. A retrieval method is the search strategy: "
-        "Dense, BM25, or Hybrid. This page compares backends with one shared configuration, then tunes RAG parameters separately."
-    )
-    experiment_rows = _dataset_questions(dataset)
-    tuning_rows = _evaluation_split(experiment_rows, "tune")
-    holdout_rows = _evaluation_split(experiment_rows, "test")
-    vector_store_options = ("NumPy (exact)", "FAISS", "ChromaDB")
-    compare_tab, tune_tab, holdout_tab = st.tabs(
-        ("Compare vector stores", "Tune hyperparameters", "Final holdout")
-    )
+def _prepare_experiment(
+    chunk_size: int,
+    overlap: int,
+    model_name: str = DEFAULT_EMBEDDING_MODEL,
+) -> tuple[list[dict[str, Any]], Any, Any]:
     corpus_path = resolve_corpus_path(dataset)
     corpus_stat = corpus_path.stat()
+    chunks, vectors = embedded_corpus(
+        dataset, *embedding_signature(model_name), chunk_size, overlap,
+        corpus_stat.st_size, corpus_stat.st_mtime_ns, corpus_total,
+    )
+    query_embedder = embedding_model(*embedding_signature(model_name))
+    return chunks, vectors, lambda text: encode_query(query_embedder, text)
 
-    def prepare_experiment(chunk_size: int, overlap: int) -> tuple[list[dict[str, Any]], Any, Any]:
-        chunks, vectors = embedded_corpus(
-            dataset,
-            *embedding_signature(),
-            chunk_size,
-            overlap,
-            corpus_stat.st_size,
-            corpus_stat.st_mtime_ns,
-            corpus_total,
+
+def _benchmark_table(results: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for item in results:
+        values = item["results"].get("metrics_at_k", {})
+        row = {
+            "Run ID": item["run_id"], "Dataset": item["config"]["dataset"],
+        "Vector store": item["config"]["store_name"], "Chunk size": item["config"]["chunk_size"],
+            "Overlap": item["config"]["overlap"], "Search limit": item["config"]["top_k"],
+            "Questions": item["results"]["queries"], "Repeats": item["results"]["successful_repeats"],
+            "Index build (s)": item["results"]["index_build_seconds_median"],
+            "Search p50 (ms)": item["results"]["search_latency_ms_p50"],
+            "Search p95 (ms)": item["results"]["search_latency_ms_p95"],
+            "RAM delta": _format_bytes(item["results"]["rss_delta_bytes_median"]),
+            "Index CPU (s)": _format_seconds(item["results"]["index_build_cpu_seconds_median"]),
+            "Search CPU (s/repeat)": _format_seconds(item["results"]["search_cpu_seconds_median"]),
+            "Relevance labels": item["results"]["relevance_level"], "Error": item["error"],
+        }
+        for cutoff, metrics in values.items():
+            row[f"Recall@{cutoff}"] = metrics["recall"]
+            row[f"NDCG@{cutoff}"] = metrics["ndcg"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _show_metric_table(results: list[dict[str, Any]], alt: str) -> None:
+    if results:
+        st.dataframe(_benchmark_table(results), hide_index=True, width="stretch", alt=alt)
+        st.caption(
+            "Lower latency, RAM, and CPU use reduce resource cost. Higher Recall@K and NDCG@K improve retrieval. "
+            "Resource values cover index construction and search in this Python process; they exclude embedding generation."
         )
-        query_embedder = embedding_model(*embedding_signature())
-        return chunks, vectors, lambda text: encode_query(query_embedder, text)
 
-    def _benchmark_table(results: list[dict[str, Any]]) -> pd.DataFrame:
-        return pd.DataFrame(
-            [
-                {
-                    "Run ID": item["run_id"],
-                    "Dataset": item["config"]["dataset"],
-                    "Backend": item["config"]["store_name"],
-                    "Chunk": item["config"]["chunk_size"],
-                    "Overlap": item["config"]["overlap"],
-                    "Top K": item["config"]["top_k"],
-                    "Questions": item["results"]["queries"],
-                    "Relevance labels": item["results"]["relevance_level"],
-                    "Repeats": item["results"]["successful_repeats"],
-                    "Index build (s)": item["results"]["index_build_seconds_median"],
-                    "Search p50 (ms)": item["results"]["search_latency_ms_p50"],
-                    "Search p95 (ms)": item["results"]["search_latency_ms_p95"],
-                    "RAM change": _format_bytes(item["results"]["rss_delta_bytes_median"]),
-                    "Build CPU (s)": _format_seconds(item["results"]["index_build_cpu_seconds_median"]),
-                    "Search CPU (s)": _format_seconds(item["results"]["search_cpu_seconds_median"]),
-                    "Recall@K": item["results"]["recall_at_k"],
-                    "NDCG@K": item["results"]["ndcg_at_k"],
-                    "Error": item["error"],
+
+def _evaluation_rows_for_source() -> list[dict[str, Any]]:
+    return _dataset_questions(dataset)
+
+if workspace == "Ask":
+    work_column, metrics_rail = st.columns([4.2, 1], gap="large", vertical_alignment="top")
+    with work_column:
+        if dataset == "jolpica":
+            st.info(f"Knowledge source: {JOLPICA_ATTRIBUTION}. Retrieved records retain their source links.")
+        st.subheader(":material/search: Ask the F1 knowledge base")
+        st.caption("Ask once, then compare the evidence and answers from each selected retrieval setup.")
+        with st.form("query_form", clear_on_submit=False, border=True):
+            question = st.text_area(
+                "Question", placeholder="Who won the 1976 Formula One World Championship?",
+                height=90, label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button("Retrieve and compare", type="primary", width="stretch")
+
+        if submitted:
+            if not question.strip():
+                st.error("Enter a question before running the comparison.")
+            elif not store_names:
+                st.error("Select at least one vector store.")
+            elif not selected_models:
+                st.error("Select at least one answer model.")
+            elif overlap >= chunk_size:
+                st.error("Chunk overlap must be smaller than chunk size.")
+            elif _requires_openrouter_key(
+                (*selected_models, *((judge_model,) if judge_enabled else ()), *((rewrite_model,) if rewrite_enabled else ()))
+            ) and not api_key:
+                st.error("Configure the API key for the selected answer, judge, or rewrite model.")
+            else:
+                payload: dict[str, Any] = {
+                    "question": question.strip(), "query": question.strip(), "stores": list(store_names),
+                    "models": list(selected_models), "retrieval_method": retrieval_method,
+                    "hits": {}, "answers": {}, "errors": {}, "chunks": {},
+                    "config": {
+                        "dataset": dataset_title, "embedding_model": selected_embedding_model,
+                        "chunk_size": chunk_size, "overlap": overlap, "top_k": top_k,
+                        "reranking_enabled": reranking_enabled,
+                        "reranker_model": reranker_name if reranking_enabled else None,
+                        "candidate_count": reranker_candidate_count if reranking_enabled else top_k,
+                    },
                 }
-                for item in results
-            ]
-        )
-
-    with compare_tab:
-        st.markdown("#### Same-settings backend comparison")
-        st.caption(
-            "This compares the storage/index backends with identical documents, embeddings, questions, and settings. "
-            "Search p50/p95 measure vector search only; Recall@K and NDCG@K measure retrieval quality. "
-            "They do not measure generated-answer accuracy."
-        )
-        compare_stores = st.multiselect(
-            "Backends to compare",
-            vector_store_options,
-            default=list(vector_store_options),
-            key="backend_compare_stores",
-        )
-        compare_columns = st.columns(4)
-        compare_chunk = compare_columns[0].selectbox("Chunk size", (128, 192, 224), index=1, key="backend_compare_chunk")
-        compare_overlap = compare_columns[1].selectbox("Overlap", (0, 16, 32, 48), index=2, key="backend_compare_overlap")
-        compare_top_k = compare_columns[2].selectbox("Top K", (3, 5, 8, 10), index=1, key="backend_compare_top_k")
-        compare_repeats = compare_columns[3].slider("Repeats", 3, 10, 5, key="backend_compare_repeats")
-        compare_sample_size = st.slider(
-            "Tuning questions", 10, 100, 30, step=10, key="backend_compare_sample"
-        )
-        if compare_overlap >= compare_chunk:
-            st.error("Overlap must be smaller than chunk size.")
-        if st.button(
-            "Compare selected backends",
-            type="primary",
-            disabled=(not compare_stores or not tuning_rows or compare_overlap >= compare_chunk),
-            key="run_backend_comparison",
-        ):
-            sample = stratified_sample(tuning_rows, min(compare_sample_size, len(tuning_rows)), seed=20261117)
-            with st.spinner("Running the same benchmark for each selected backend…"):
                 try:
-                    results = run_hyperparameter_grid(
-                        dataset=dataset,
-                        store_names=compare_stores,
-                        embedding_model=EMBEDDING_MODEL_ID,
-                        chunk_sizes=(compare_chunk,),
-                        overlaps=(compare_overlap,),
-                        top_ks=(compare_top_k,),
-                        repeats=compare_repeats,
-                        prepare=prepare_experiment,
-                        queries=sample,
-                        output_dir=KNOWLEDGE_BASE / "runs",
-                    )
-                    st.session_state["backend_compare_results"] = results
-                except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                    st.error(f"Backend comparison failed: {error}")
-        comparison_results = st.session_state.get("backend_compare_results", [])
-        if comparison_results:
-            st.dataframe(
-                _benchmark_table(comparison_results),
-                hide_index=True,
-                width="stretch",
-                alt="Same-settings vector backend comparison by latency, retrieval quality, RAM, and CPU",
-            )
+                    if rewrite_enabled:
+                        with st.spinner("Rewriting the search query…"):
+                            payload["query"], rewrite_error = rewrite_query_safely(
+                                question.strip(), rewrite_model, corpus_preview(dataset), api_key
+                            )
+                            if rewrite_error:
+                                payload["errors"]["rewrite"] = rewrite_error
+                    with st.spinner("Loading the embedding model…"):
+                        embedder = embedding_model(*embedding_signature(selected_embedding_model))
+                    query_vector = encode_query(embedder, payload["query"])
+                except (RuntimeError, ValueError, OSError) as error:
+                    LOGGER.exception("Failed to load the embedding model or encode the query.")
+                    payload["errors"]["retrieval"] = str(error)
+                    query_vector = None
+
+                if query_vector is not None:
+                    selected_reranker = None
+                    if reranking_enabled:
+                        try:
+                            with st.spinner(f"Loading reranker {reranker_name}…"):
+                                selected_reranker = load_selected_reranker(reranker_name)
+                        except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                            payload["errors"]["reranking"] = str(error)
+                            payload["config"]["reranking_enabled"] = False
+                    for store_name in store_names:
+                        try:
+                            with st.spinner(f"Searching {store_name}… (the first run builds its index)"):
+                                candidate_limit = reranker_candidate_count if selected_reranker else top_k
+                                candidates, count = _get_hits(
+                                    dataset, store_name, chunk_size, overlap, query_vector, candidate_limit,
+                                    payload["query"], retrieval_method, selected_embedding_model,
+                                )
+                            if selected_reranker:
+                                hits = rerank_candidates(
+                                    selected_reranker, payload["query"], candidates, top_k
+                                )
+                            else:
+                                hits = candidates[:top_k]
+                            payload["hits"][store_name] = hits
+                            payload["chunks"][store_name] = count
+                        except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                            payload["errors"][store_name] = str(error)
+
+                    for store_name, hits in payload["hits"].items():
+                        for model in selected_models:
+                            key = f"{store_name}::{model}"
+                            try:
+                                with st.spinner(f"Generating with {_model_label(model)} · {store_name}…"):
+                                    context = _context_window(model)
+                                    response = answer_question(
+                                        payload["question"], hits, model, api_key,
+                                        context_length=context if isinstance(context, int) else None,
+                                    )
+                                payload["answers"][key] = {"text": response, "judge": None}
+                            except (RuntimeError, ValueError) as error:
+                                payload["errors"][key] = str(error)
+                                continue
+
+                            if judge_enabled:
+                                try:
+                                    with st.spinner(f"Judging {_model_label(model)} · {store_name}…"):
+                                        evidence = "\n\n".join(
+                                            f"Source: {hit.get('source', 'unknown')}\n"
+                                            f"Source URL: {hit.get('source_url', '')}\n{hit.get('text', '')}"
+                                            for hit in hits
+                                        )
+                                        payload["answers"][key]["judge"] = judge_answer(
+                                            payload["question"], evidence, response, judge_model, api_key
+                                        )
+                                except (RuntimeError, ValueError) as error:
+                                    payload["errors"][f"{key} judge"] = str(error)
+                st.session_state["last_comparison"] = payload
+
+        payload = st.session_state.get("last_comparison")
+        if payload:
+            st.markdown(f"**Question:** {payload['question']}")
+            config = payload.get("config", {})
             st.caption(
-                "Lower search latency, RAM, and CPU use reduce resource cost. Higher Recall@K and NDCG@K improve retrieval. "
-                "No single backend is best on every metric. Results are saved with run IDs and environment details."
+                f"{config.get('dataset', dataset_title)} · {config.get('embedding_model', selected_embedding_model)} · "
+                f"{payload.get('retrieval_method', 'Dense')} · "
+                f"chunk {config.get('chunk_size', '—')} / overlap {config.get('overlap', '—')} / top {config.get('top_k', '—')} · "
+                f"reranking {'on' if config.get('reranking_enabled') else 'off'}"
             )
-        st.info("Generated-answer QA accuracy is evaluated separately in the Evaluation tab with the selected judge model.")
+            if payload.get("query") != payload.get("question"):
+                st.caption(f"Rewritten retrieval query: {payload['query']}")
+            if payload["errors"].get("rewrite"):
+                st.warning(payload["errors"]["rewrite"])
+            if payload["errors"].get("reranking"):
+                st.warning(f"Reranking failed; showing retrieval order. {payload['errors']['reranking']}")
+            if payload["errors"].get("retrieval"):
+                st.error(payload["errors"]["retrieval"])
+            displayed_stores = payload.get("stores", list(payload["hits"]))
+            displayed_models = payload.get("models", selected_models)
+            if not displayed_stores:
+                st.info("No retrieval setup was included in this comparison.")
+            else:
+                columns = st.columns(len(displayed_stores))
+                for column, store_name in zip(columns, displayed_stores):
+                    with column:
+                        st.markdown(f"### {store_name}")
+                        store_hits = payload["hits"].get(store_name, [])
+                        if store_name in payload["chunks"]:
+                            st.caption(f"{payload['chunks'][store_name]:,} chunks · {len(store_hits)} retrieved")
+                        elif store_name in payload["errors"]:
+                            st.error(f"Search failed: {payload['errors'][store_name]}")
+                        elif payload["errors"].get("retrieval"):
+                            st.info("Search did not run because query preparation failed.")
+                        for model in displayed_models:
+                            key = f"{store_name}::{model}"
+                            st.markdown(f"**{_model_label(model)}**")
+                            result = payload["answers"].get(key)
+                            if result:
+                                st.write(result["text"])
+                                _render_source_citations(store_hits)
+                                verdict = result.get("judge")
+                                if verdict:
+                                    st.badge(
+                                        "Supported" if verdict["correct"] else "Needs review",
+                                        icon=":material/check_circle:" if verdict["correct"] else ":material/warning:",
+                                        color="green" if verdict["correct"] else "orange",
+                                    )
+                                    st.caption(f"Judge note: {verdict['reason']}")
+                            elif key in payload["errors"]:
+                                st.error(f"Answer failed: {payload['errors'][key]}")
+                        if store_hits:
+                            with st.expander(f"Retrieved evidence · {store_name}"):
+                                for rank, hit in enumerate(store_hits, start=1):
+                                    st.markdown(
+                                        f"**[{rank}] {hit.get('source', 'Unknown source')}** · score `{hit.get('score', 0):.3f}`"
+                                    )
+                                if "rerank_score" in hit:
+                                    st.caption(
+                                        f"Cross-encoder score: {hit['rerank_score']:.3f} · "
+                                        f"retrieval rank: {hit['retrieval_rank']}"
+                                    )
+                                    source_url = hit.get("source_url")
+                                    if source_url and source_url.startswith(JOLPICA_API_BASE + "/"):
+                                        st.markdown(f"[View {JOLPICA_ATTRIBUTION} record]({source_url})")
+                                    elif str(hit.get("source", "")).startswith("Wikipedia:"):
+                                        wikipedia_url = source_url or wikipedia_source_url(
+                                            str(hit["source"]).removeprefix("Wikipedia:")
+                                        )
+                                        st.markdown(f"[View Wikipedia article]({wikipedia_url})")
+                                    st.write(hit.get("text", ""))
+                                    if rank < len(store_hits):
+                                        st.divider()
+            for key, message in payload["errors"].items():
+                if key == "retrieval" or key.endswith(" judge"):
+                    st.caption(f"{key}: {message}")
+    with metrics_rail:
+        st.caption("SESSION SNAPSHOT")
+        st.metric("Selected source", dataset_title, border=True)
+        st.metric("Source documents", f"{corpus_total:,}", border=True)
+        st.metric("Evaluation Q&A", f"{qa_total:,}", border=True)
+        st.metric("Chunk / overlap", f"{chunk_size} / {overlap}", border=True)
+        st.caption("[by Mojtaba](https://github.com/Sadatpour)")
 
-    with tune_tab:
-        st.markdown("#### Tune retrieval settings")
-        st.caption(
-            "Use the tuning split to compare chunk size, overlap, and Top K. The grid reuses the same corpus and question sample "
-            "for each backend and setting. Do not choose settings from the holdout results."
-        )
-        experiment_stores = st.multiselect(
-            "Backends to tune",
-            vector_store_options,
-            default=["NumPy (exact)"],
-            key="experiment_stores",
-        )
-        experiment_sizes = st.multiselect(
-            "Chunk sizes (embedding tokens)", (128, 192, 224), default=[128, 192, 224], key="experiment_chunk_sizes"
-        )
-        experiment_overlaps = st.multiselect(
-            "Overlap (tokens)", (0, 16, 32, 48), default=[0, 16, 32], key="experiment_overlaps"
-        )
-        experiment_top_ks = st.multiselect(
-            "Retrieved chunk counts", (3, 5, 8, 10), default=[3, 5, 8], key="experiment_top_ks"
-        )
-        experiment_repeats = st.slider("Index and query repetitions", 3, 10, 5, key="experiment_repeats")
-        experiment_sample_size = st.slider(
-            "Tuning Q&A sample", 10, 100, 30, step=10, key="experiment_sample_size"
-        )
-        valid_overlap = any(overlap < size for size in experiment_sizes for overlap in experiment_overlaps)
-        estimate = len(experiment_sizes) * len(experiment_overlaps) * len(experiment_top_ks) * len(experiment_stores) * experiment_repeats
-        st.caption(f"Approximate index builds: {estimate:,}; invalid overlap/size pairs are skipped.")
-        if st.button(
-            "Run hyperparameter grid",
-            type="primary",
-            disabled=not all((experiment_stores, experiment_sizes, experiment_overlaps, experiment_top_ks, tuning_rows, valid_overlap)),
-        ):
-            tuning_sample = stratified_sample(
-                tuning_rows, min(experiment_sample_size, len(tuning_rows)), seed=20261117
-            )
-            with st.spinner("Measuring the selected settings…"):
-                try:
-                    grid_results = run_hyperparameter_grid(
-                        dataset=dataset,
-                        store_names=experiment_stores,
-                        embedding_model=EMBEDDING_MODEL_ID,
-                        chunk_sizes=experiment_sizes,
-                        overlaps=experiment_overlaps,
-                        top_ks=experiment_top_ks,
-                        repeats=experiment_repeats,
-                        prepare=prepare_experiment,
-                        queries=tuning_sample,
-                        output_dir=KNOWLEDGE_BASE / "runs",
-                    )
-                    st.session_state["tuning_results"] = grid_results
-                except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                    st.error(f"The tuning experiment failed: {error}")
-        grid_results = st.session_state.get("tuning_results", [])
-        if grid_results:
+elif workspace == "Evaluation & benchmark":
+    evaluation_pool = _evaluation_rows_for_source()
+    tuning_rows = _evaluation_split(evaluation_pool, "tune")
+    holdout_rows = _evaluation_split(evaluation_pool, "test")
+    st.subheader(":material/query_stats: Evaluation and benchmark")
+    st.caption(
+        f"{dataset_title} · {len(evaluation_pool):,} of {qa_total:,} QA questions match the corpus; "
+        f"{len(tuning_rows):,} are available for tuning and evaluation."
+    )
+
+    if evaluation_view == "Retrieval quality":
+        st.markdown("#### Retrieval quality by Top K")
+        st.caption("Recall@K and NDCG@K use source labels from qa.jsonl. These metrics measure retrieval, not answer generation.")
+        if run_retrieval_eval:
+            if not tuning_rows:
+                st.error("No labeled questions match the selected source.")
+            else:
+                sample = stratified_sample(tuning_rows, min(eval_sample_size, len(tuning_rows)), seed=42)
+                results = []
+                progress = st.progress(0, text="Running retrieval evaluation…")
+                for index, store_name in enumerate(eval_store_names):
+                    try:
+                        metrics = _run_retrieval_evaluation(
+                            dataset, store_name, eval_chunk_size, eval_overlap,
+                            sample, eval_top_ks, eval_method, selected_embedding_model,
+                        )
+                        results.append({
+                            "Search backend": store_name, "Retrieval method": eval_method,
+                            "Chunk size": eval_chunk_size, "Overlap": eval_overlap, **metrics,
+                        })
+                    except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                        st.error(f"{store_name}: {error}")
+                    progress.progress((index + 1) / len(eval_store_names), text=f"Evaluated {store_name}")
+                st.session_state["retrieval_eval_results"] = results
+                progress.empty()
+        results = st.session_state.get("retrieval_eval_results", [])
+        if results:
+            table = []
+            for item in results:
+                row = {key: value for key, value in item.items() if key != "metrics_at_k"}
+                for cutoff, metrics in item["metrics_at_k"].items():
+                    row[f"Recall@{cutoff}"] = metrics["recall"]
+                    row[f"NDCG@{cutoff}"] = metrics["ndcg"]
+                table.append(row)
             st.dataframe(
-                _benchmark_table(grid_results),
-                alt="Hyperparameter tuning results by backend, latency, retrieval quality, RAM, and CPU",
-                hide_index=True,
-                width="stretch",
+                pd.DataFrame(table), hide_index=True, width="stretch",
+                alt="Retrieval Recall and NDCG by vector store and Top K",
             )
-            st.caption("Full results, including run ID and software/hardware metadata, are appended to knowledge_base/runs/runs.jsonl.")
 
-    with holdout_tab:
-        st.markdown("#### One-time final comparison")
+    elif evaluation_view == "Answer accuracy":
+        st.markdown("#### Generated answer accuracy")
+        st.caption("The judge compares each generated answer with the matching reference answer in qa.jsonl.")
+        if run_qa_eval:
+            if not tuning_rows:
+                st.error("No labeled questions match the selected source.")
+            elif _requires_openrouter_key((qa_model, qa_judge_model)) and not api_key:
+                st.error("Configure the API key for the selected answer and judge models.")
+            else:
+                sample = stratified_sample(tuning_rows, min(qa_sample_size, len(tuning_rows)), seed=7)
+                errors = []
+                results = []
+                progress = st.progress(0, text="Preparing answer evaluation…")
+                total = len(sample) * len(qa_store_names)
+                completed = 0
+                try:
+                    embedder = embedding_model(*embedding_signature(selected_embedding_model))
+                    encoded = [encode_query(embedder, str(row["question"])) for row in sample]
+                    for store_name in qa_store_names:
+                        verdicts = []
+                        try:
+                            for row, query_vector in zip(sample, encoded, strict=True):
+                                hits, _ = _get_hits(
+                                    dataset, store_name, qa_chunk_size, qa_overlap, query_vector,
+                                    qa_top_k, str(row["question"]), qa_method, selected_embedding_model,
+                                )
+                                answer = answer_question(
+                                    str(row["question"]), hits, qa_model, api_key,
+                                    context_length=_context_window(qa_model),
+                                )
+                                verdict = judge_answer(
+                                    str(row["question"]), str(row.get("answer", "")),
+                                    answer, qa_judge_model, api_key,
+                                )
+                                verdicts.append(verdict)
+                                completed += 1
+                                progress.progress(completed / total, text=f"{store_name}: {len(verdicts)}/{len(sample)}")
+                            results.append({
+                                "Search backend": store_name, "Retrieval method": qa_method,
+                                "Top K": qa_top_k, "Chunk size": qa_chunk_size, "Overlap": qa_overlap,
+                                "QA accuracy": qa_accuracy(verdicts), "Questions judged": len(verdicts),
+                                "Answer model": qa_model, "Judge model": qa_judge_model,
+                            })
+                        except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                            errors.append(f"{store_name}: {error}")
+                    st.session_state["answer_eval_results"] = results
+                    st.session_state["answer_eval_errors"] = errors
+                except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                    st.error(f"Answer evaluation failed: {error}")
+                progress.empty()
+        results = st.session_state.get("answer_eval_results", [])
+        if results:
+            st.dataframe(
+                pd.DataFrame(results), hide_index=True, width="stretch",
+                alt="LLM judged answer accuracy across retrieval backends",
+            )
+        for error in st.session_state.get("answer_eval_errors", []):
+            st.error(error)
+
+    elif evaluation_view == "Vector-store benchmark":
+        st.markdown("#### Vector-store resource and retrieval comparison")
         st.caption(
-            "Select all backends you want to compare before the first run. They use the same held-out questions and one shared configuration. "
-            "After a successful holdout run for this dataset, do not tune against it."
+            "Every backend receives the same chunks, document vectors, and questions. Search latency excludes query embedding. "
+            "RAM and CPU are measured in the app process while building and searching the index."
         )
-        test_stores = st.multiselect(
-            "Backends for final comparison",
-            vector_store_options,
-            default=list(vector_store_options),
-            key="holdout_stores",
-        )
-        holdout_columns = st.columns(3)
-        test_chunk_size = holdout_columns[0].selectbox("Chunk size", (128, 192, 224), index=1, key="holdout_chunk_size")
-        test_overlap = holdout_columns[1].selectbox("Overlap", (0, 16, 32, 48), index=2, key="holdout_overlap")
-        test_top_k = holdout_columns[2].selectbox("Top K", (3, 5, 8, 10), index=1, key="holdout_top_k")
-        run_log = KNOWLEDGE_BASE / "runs" / "runs.jsonl"
-        prior_holdout = False
-        if run_log.is_file():
+        if run_backend_benchmark:
+            sample = stratified_sample(
+                tuning_rows, min(benchmark_sample_size, len(tuning_rows)), seed=20261117
+            )
             try:
-                prior_holdout = any(
-                    (saved_run := json.loads(line)).get("config", {}).get("dataset") == dataset
-                    and saved_run.get("config", {}).get("evaluation_split") == "holdout"
-                    and saved_run.get("error") is None
-                    for line in run_log.read_text(encoding="utf-8").splitlines()
+                results = run_hyperparameter_grid(
+                    dataset=dataset, store_names=benchmark_stores,
+                    embedding_model=embedding_profile(selected_embedding_model)["repo_id"],
+                    chunk_sizes=(benchmark_chunk_size,), overlaps=(benchmark_overlap,),
+                    top_ks=(max(benchmark_top_ks),), metric_ks=benchmark_top_ks,
+                    repeats=benchmark_repeats,
+                    prepare=lambda size, overlap: _prepare_experiment(size, overlap, selected_embedding_model),
+                    queries=sample, output_dir=KNOWLEDGE_BASE / "runs",
                 )
-            except (OSError, json.JSONDecodeError):
-                st.warning("Could not read the experiment history; holdout protection is unavailable.")
-        if prior_holdout:
-            st.info("This dataset already has a successful holdout result in the experiment log.")
-        if test_overlap >= test_chunk_size:
-            st.error("Overlap must be smaller than chunk size.")
-        if st.button(
-            "Run selected backends on holdout once",
-            type="primary",
-            disabled=(not test_stores or not holdout_rows or prior_holdout or test_overlap >= test_chunk_size),
-        ):
-            test_sample = stratified_sample(holdout_rows, len(holdout_rows), seed=20261118)
+                st.session_state["backend_benchmark_results"] = results
+            except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                st.error(f"Vector-store benchmark failed: {error}")
+        results = st.session_state.get("backend_benchmark_results", [])
+        _show_metric_table(
+            results, "Vector-store benchmark with resource use and retrieval quality at multiple Top K values"
+        )
+        if results:
+            st.caption("Run IDs and hardware/software details are saved in knowledge_base/runs/runs.jsonl.")
+    elif evaluation_view == "Hyperparameter tuning":
+        st.markdown("#### Tune chunking and retrieval settings")
+        st.caption("Use tuning questions to choose settings. Each record includes its backend and full configuration.")
+        if run_tuning and tuning_rows:
+            sample = stratified_sample(tuning_rows, min(tuning_sample_size, len(tuning_rows)), seed=20261117)
             try:
-                chunks, vectors, query_encoder = prepare_experiment(test_chunk_size, test_overlap)
-                holdout_results = []
-                progress = st.progress(0, text="Comparing final holdout results…")
-                for index, test_store in enumerate(test_stores):
+                results = run_hyperparameter_grid(
+                    dataset=dataset, store_names=tuning_stores,
+                    embedding_model=embedding_profile(selected_embedding_model)["repo_id"],
+                    chunk_sizes=tuning_chunk_sizes, overlaps=tuning_overlaps,
+                    top_ks=tuning_top_ks, repeats=tuning_repeats,
+                    prepare=lambda size, overlap: _prepare_experiment(size, overlap, selected_embedding_model),
+                    output_dir=KNOWLEDGE_BASE / "runs",
+                )
+                st.session_state["tuning_results"] = results
+            except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
+                st.error(f"Hyperparameter tuning failed: {error}")
+        results = st.session_state.get("tuning_results", [])
+        _show_metric_table(results, "Hyperparameter tuning results by chunk size, overlap, Top K, and vector store")
+        if results:
+            st.caption("Compare Recall@K and NDCG@K with p50/p95 latency, RAM delta, and CPU before selecting settings.")
+
+    else:
+        st.markdown("#### Final holdout comparison")
+        st.caption("The reserved split is for the final comparison, after settings are selected on tuning data.")
+        if run_holdout and holdout_rows:
+            try:
+                chunks, vectors, query_encoder = _prepare_experiment(
+                    holdout_chunk_size, holdout_overlap, selected_embedding_model
+                )
+                sample = stratified_sample(holdout_rows, len(holdout_rows), seed=20261118)
+                results = []
+                progress = st.progress(0, text="Running final comparison…")
+                for index, store_name in enumerate(holdout_stores):
                     result = benchmark_store(
                         BenchmarkConfig(
-                            dataset,
-                            test_store,
-                            EMBEDDING_MODEL_ID,
-                            test_chunk_size,
-                            test_overlap,
-                            test_top_k,
-                            repeats=1,
-                            evaluation_split="holdout",
+                            dataset=dataset, store_name=store_name,
+                            embedding_model=embedding_profile(selected_embedding_model)["repo_id"],
+                            chunk_size=holdout_chunk_size, overlap=holdout_overlap,
+                            top_k=max(holdout_top_ks), repeats=1,
+                            evaluation_split="holdout", metric_ks=tuple(holdout_top_ks),
                         ),
-                        chunks,
-                        vectors,
-                        test_sample,
-                        query_encoder,
-                        KNOWLEDGE_BASE / "runs",
+                        chunks, vectors, sample, query_encoder, KNOWLEDGE_BASE / "runs",
                     )
-                    holdout_results.append(result)
-                    progress.progress((index + 1) / len(test_stores), text=f"Measured {test_store}")
-                st.session_state["holdout_results"] = holdout_results
+                    results.append(result)
+                    progress.progress((index + 1) / len(holdout_stores), text=f"Measured {store_name}")
+                st.session_state["holdout_results"] = results
                 progress.empty()
             except (RuntimeError, ValueError, FileNotFoundError, OSError) as error:
-                st.error(f"The holdout comparison failed: {error}")
-        holdout_results = st.session_state.get("holdout_results", [])
-        if holdout_results:
-            st.dataframe(
-                _benchmark_table(holdout_results),
-                alt="Final holdout comparison across the selected vector backends",
-                hide_index=True,
-                width="stretch",
-            )
-            if any(result["error"] for result in holdout_results):
-                st.warning("At least one backend failed. The holdout can be used only once, so resolve optional dependencies before running it.")
-            else:
-                st.success(f"Compared {len(holdout_results)} backends on the same {len(holdout_rows)} held-out questions.")
+                st.error(f"Final holdout comparison failed: {error}")
+        results = st.session_state.get("holdout_results", [])
+        _show_metric_table(results, "Final holdout benchmark across vector stores")
+        if results and all(result["error"] is None for result in results):
+            st.success(f"Compared {len(results)} vector stores on {len(holdout_rows):,} held-out questions.")
+        elif results:
+            st.warning("At least one backend failed. Resolve that backend before relying on the comparison.")
 
-with about_tab:
-    st.subheader(":material/route: Project map")
+else:
+    st.subheader(":material/route: Project guide")
     st.markdown(
         """
-        - `knowledge_base/corpora/` — Independent, ready-to-use Wikipedia and Jolpica corpora
-        - `knowledge_base/evaluation/` — Reference QA set for evaluation
-        - `knowledge_base/indices/` — Rebuildable local indexes (excluded from Git)
-        - `models/embedding/` — Downloaded Hugging Face embedding model
-        - `models/llm/` — OpenRouter-hosted models; model weights are not stored locally
-        - `config/models.toml` — Answer, judge, and rewrite model IDs; embedding model paths
+        - `knowledge_base/corpora/` — Ready-to-use Wikipedia and Jolpica corpora
+        - `knowledge_base/evaluation/qa.jsonl` — Reference questions and answers
+        - `knowledge_base/indices/` — Rebuildable local indexes
+        - `models/embedding/` — Local embedding model files
+        - `config/models.toml` — Answer, judge, rewrite, and embedding model settings
         - `.env` — Provider API keys; excluded from Git
         - `src/f1_rag/` — Ingestion, chunking, embeddings, vector stores, retrieval, generation, and evaluation
 
-        **NumPy exact cosine** is a local vector-index baseline. **FAISS** is a similarity-search library. **ChromaDB** is a vector database.
-        They are grouped as alternative vector-store/index backends for controlled comparison; none of these names is a retrieval method.
+        **NumPy exact cosine** is the local dense-search baseline. **FAISS** is a similarity-search library. **ChromaDB** is a vector database.
+        These are vector-store/index backends. **Dense**, **BM25**, and **Hybrid** are retrieval methods.
         """
     )
     st.info(
-        "Chunks are sized in tokens with the embedding model tokenizer and capped below its 256-token "
-        "input limit. First-time index builds embed documents in batches and show progress. Model context "
-        "windows come from the OpenRouter catalog; unavailable values are shown as “not listed.”"
+        "The index reuses document vectors. Each question is embedded once for search. Retrieval evaluation checks source labels in qa.jsonl; "
+        "answer accuracy compares generated answers with its reference answers."
     )
     st.markdown(
         f"Jolpica data attribution: [{JOLPICA_ATTRIBUTION}]({JOLPICA_API_BASE}/). "

@@ -2,6 +2,21 @@
 repo_id = "sentence-transformers/all-MiniLM-L6-v2"
 local_path = "models/embedding/all-MiniLM-L6-v2"
 weights_path = "models/embedding/all-MiniLM-L6-v2/model.safetensors"
+default_model = "sentence-transformers/all-MiniLM-L6-v2"
+
+[embedding.models."sentence-transformers/all-MiniLM-L6-v2"]
+repo_id = "sentence-transformers/all-MiniLM-L6-v2"
+local_path = "models/embedding/all-MiniLM-L6-v2"
+weights_path = "models/embedding/all-MiniLM-L6-v2/model.safetensors"
+
+[reranking]
+default_model = "cross-encoder/ms-marco-MiniLM-L6-v2"
+candidate_count = 30
+
+[reranking.models."cross-encoder/ms-marco-MiniLM-L6-v2"]
+repo_id = "cross-encoder/ms-marco-MiniLM-L6-v2"
+local_path = "models/reranker/ms-marco-MiniLM-L6-v2"
+max_length = 512
 
 [openrouter]
 answer_models = [
@@ -86,7 +101,8 @@ model_id = "openrouter/free"
 capabilities = ["chat", "json"]
 
 [routing]
-# Ordered fallback; only transient network, rate-limit, and server failures advance to the next model.
+# Ordered fallback. Quota, access, billing, model, network, and server failures skip to the next model.
+# Failed models enter a persisted cooldown, so later requests do not immediately hit the same failure again.
 answer_rotation = [
     "openrouter::openrouter/free",
     "gemini::gemma-4-31b-it",

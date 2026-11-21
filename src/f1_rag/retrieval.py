@@ -22,16 +22,23 @@ from f1_rag.stores import create_store
 INDEX_ROOT = KNOWLEDGE_BASE / "indices"
 
 
-def _fingerprint(corpus_path: Path, chunk_size: int, overlap: int) -> str:
+def _fingerprint(
+    corpus_path: Path,
+    chunk_size: int,
+    overlap: int,
+    embedding_model_id: str = EMBEDDING_MODEL_ID,
+    embedding_model_path: Path = EMBEDDING_MODEL_PATH,
+    embedding_weights_path: Path = EMBEDDING_WEIGHTS_PATH,
+) -> str:
     stat = corpus_path.stat()
-    weights_stat = EMBEDDING_WEIGHTS_PATH.stat() if EMBEDDING_WEIGHTS_PATH.is_file() else None
+    weights_stat = embedding_weights_path.stat() if embedding_weights_path.is_file() else None
     weights_signature = (
         f"{weights_stat.st_size}:{weights_stat.st_mtime_ns}" if weights_stat else "not-present"
     )
     payload = (
         f"token-chunking-v2:{corpus_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
-        f"{chunk_size}:{overlap}:{EMBEDDING_MODEL_ID}:{EMBEDDING_MODEL_PATH.resolve()}:"
-        f"{EMBEDDING_WEIGHTS_PATH.resolve()}:{weights_signature}"
+        f"{chunk_size}:{overlap}:{embedding_model_id}:{embedding_model_path.resolve()}:"
+        f"{embedding_weights_path.resolve()}:{weights_signature}"
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -101,9 +108,15 @@ def prepare_index(
     knowledge_base: Path = KNOWLEDGE_BASE,
     precomputed: tuple[list[dict[str, Any]], np.ndarray] | None = None,
     precompute: Callable[[], tuple[list[dict[str, Any]], np.ndarray]] | None = None,
+    embedding_model_id: str = EMBEDDING_MODEL_ID,
+    embedding_model_path: Path = EMBEDDING_MODEL_PATH,
+    embedding_weights_path: Path = EMBEDDING_WEIGHTS_PATH,
 ) -> tuple[Any, int, bool]:
     corpus_path = resolve_corpus_path(dataset, knowledge_base)
-    fingerprint = _fingerprint(corpus_path, chunk_size, overlap)
+    fingerprint = _fingerprint(
+        corpus_path, chunk_size, overlap,
+        embedding_model_id, embedding_model_path, embedding_weights_path,
+    )
     store = create_store(store_name, _index_path(dataset, store_name, fingerprint))
     if store.load(fingerprint):
         if hasattr(store, "documents"):
