@@ -689,6 +689,7 @@ with st.sidebar:
             reranker_options,
             index=reranker_options.index(DEFAULT_RERANKER_MODEL) if DEFAULT_RERANKER_MODEL in reranker_options else 0,
             key="ask_reranker_model",
+            disabled=not reranking_enabled or direct_source_search,
         ) if reranker_options else ""
         reranker_candidate_count = st.select_slider(
             "Candidate chunks before reranking",
@@ -698,7 +699,7 @@ with st.sidebar:
             disabled=not reranking_enabled or direct_source_search,
             help="Retrieve this many candidates first. The reranker then selects the final Top K chunks.",
         )
-        judge_enabled = st.toggle("Judge against retrieved evidence", value=True, key="ask_judge_enabled")
+        judge_enabled = st.toggle("Judge against retrieved evidence", value=False, key="ask_judge_enabled")
         judge_model = st.selectbox(
             "Judge model", model_options,
             index=model_options.index(DEFAULT_JUDGE_MODEL) if DEFAULT_JUDGE_MODEL in model_options else 0,
