@@ -12,7 +12,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from f1_rag.chunking import chunk_documents
+from f1_rag.chunking import (
+    FIXED_CHUNKING,
+    RECURSIVE_CHUNKING,
+    SEMANTIC_CHUNKING,
+    chunk_documents,
+)
 from f1_rag.embeddings import DEFAULT_EMBEDDING_MODEL, EMBEDDING_PROFILES
 from f1_rag.evaluation import (
     ndcg_at_n,
@@ -38,6 +43,30 @@ from f1_rag.stores import NumpyStore
 
 
 class ChunkingTests(unittest.TestCase):
+    class WhitespaceTokenizer:
+        @staticmethod
+        def num_special_tokens_to_add(pair: bool = False) -> int:
+            del pair
+            return 0
+
+        @staticmethod
+        def encode(
+            text: str,
+            add_special_tokens: bool = False,
+            verbose: bool = True,
+        ) -> list[str]:
+            del add_special_tokens, verbose
+            return text.split()
+
+        @staticmethod
+        def decode(
+            tokens: list[str],
+            skip_special_tokens: bool = True,
+            clean_up_tokenization_spaces: bool = True,
+        ) -> str:
+            del skip_special_tokens, clean_up_tokenization_spaces
+            return " ".join(tokens)
+
     def test_chunks_have_requested_size_and_overlap(self) -> None:
         words = [f"word{index}" for index in range(11)]
         chunks = chunk_documents([{"id": "doc", "text": " ".join(words)}], chunk_size=5, overlap=2)
@@ -47,6 +76,63 @@ class ChunkingTests(unittest.TestCase):
     def test_overlap_must_be_less_than_chunk_size(self) -> None:
         with self.assertRaises(ValueError):
             chunk_documents([{"id": "doc", "text": "words"}], chunk_size=5, overlap=5)
+
+    def test_fixed_chunking_remains_the_default(self) -> None:
+        document = [{"id": "doc", "text": "one two three four five"}]
+        self.assertEqual(
+            chunk_documents(document, chunk_size=3, overlap=0),
+            chunk_documents(document, chunk_size=3, overlap=0, method=FIXED_CHUNKING),
+        )
+
+    def test_recursive_chunking_respects_token_limit_and_preserves_text(self) -> None:
+        text = "First paragraph has words.\n\nSecond paragraph also has words."
+        chunks = chunk_documents(
+            [{"id": "doc", "text": text}],
+            chunk_size=4,
+            overlap=0,
+            tokenizer=self.WhitespaceTokenizer(),
+            max_tokens=4,
+            method=RECURSIVE_CHUNKING,
+        )
+
+        self.assertTrue(all(len(chunk["text"].split()) <= 4 for chunk in chunks))
+        normalized_chunks = " ".join(" ".join(chunk["text"].split()) for chunk in chunks)
+        self.assertEqual(normalized_chunks, " ".join(text.split()))
+        self.assertGreaterEqual(len(chunks), 2)
+
+    def test_semantic_chunking_splits_when_neighboring_sentence_meaning_changes(self) -> None:
+        def encode(sentences: list[str], **_kwargs: object) -> np.ndarray:
+            return np.asarray(
+                [[1, 0] if "Meanwhile" not in sentence else [0, 1] for sentence in sentences],
+                dtype=np.float32,
+            )
+
+        chunks = chunk_documents(
+            [{
+                "id": "doc",
+                "text": (
+                    "Formula One is a racing series. Its drivers compete worldwide. "
+                    "Meanwhile, the garden is full of flowers."
+                ),
+            }],
+            chunk_size=20,
+            overlap=0,
+            tokenizer=self.WhitespaceTokenizer(),
+            max_tokens=20,
+            method=SEMANTIC_CHUNKING,
+            semantic_encoder=encode,
+        )
+
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("Its drivers compete worldwide.", chunks[0]["text"])
+        self.assertIn("Meanwhile", chunks[1]["text"])
+
+    def test_semantic_chunking_requires_an_encoder(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires an embedding encoder"):
+            chunk_documents(
+                [{"id": "doc", "text": "A sentence."}],
+                method=SEMANTIC_CHUNKING,
+            )
 
     def test_token_chunks_respect_model_limit_and_overlap(self) -> None:
         class WhitespaceTokenizer:
@@ -178,9 +264,16 @@ class RetrievalTests(unittest.TestCase):
                 overlap=80,
                 embedding_model_id="another/embedding-model",
             )
+            recursive_fingerprint = _fingerprint(
+                corpus,
+                chunk_size=500,
+                overlap=80,
+                chunking_method=RECURSIVE_CHUNKING,
+            )
 
         self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
         self.assertNotEqual(fingerprint, other_model_fingerprint)
+        self.assertNotEqual(fingerprint, recursive_fingerprint)
 
     def test_documents_are_embedded_in_batches_with_progress(self) -> None:
         class WhitespaceTokenizer:

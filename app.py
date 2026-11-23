@@ -30,6 +30,12 @@ from f1_rag.embeddings import (
     embedding_profile,
     load_embedding_model,
 )
+from f1_rag.chunking import (
+    CHUNKING_METHODS,
+    FIXED_CHUNKING,
+    RECURSIVE_CHUNKING,
+    SEMANTIC_CHUNKING,
+)
 from f1_rag.evaluation import ndcg_at_n, qa_accuracy, recall_at_n, stratified_sample
 from f1_rag.benchmark import BenchmarkConfig, benchmark_store, run_hyperparameter_grid
 from f1_rag.ingest import KNOWLEDGE_BASE, iter_documents, resolve_corpus_path
@@ -235,6 +241,7 @@ def embedded_corpus(
     weights_mtime: int,
     chunk_size: int,
     overlap: int,
+    chunking_method: str,
     corpus_size: int,
     corpus_mtime: int,
     corpus_document_count: int,
@@ -248,6 +255,7 @@ def embedded_corpus(
             embedder,
             chunk_size,
             overlap,
+            chunking_method=chunking_method,
             on_progress=lambda document_index: progress.progress(
                 min(document_index / max(corpus_document_count, 1), 1.0),
                 text=f"Embedded {document_index:,}/{corpus_document_count:,} documents…",
@@ -272,6 +280,7 @@ def indexed_corpus(
     weights_mtime: int,
     chunk_size: int,
     overlap: int,
+    chunking_method: str,
     corpus_size: int,
     corpus_mtime: int,
     corpus_document_count: int,
@@ -291,6 +300,7 @@ def indexed_corpus(
             weights_mtime,
             chunk_size,
             overlap,
+            chunking_method,
             corpus_size,
             corpus_mtime,
             corpus_document_count,
@@ -298,6 +308,7 @@ def indexed_corpus(
         embedding_model_id=model_id,
         embedding_model_path=Path(model_path),
         embedding_weights_path=Path(weights_path),
+        chunking_method=chunking_method,
     )
 
 
@@ -340,6 +351,7 @@ def _corpus_sources(dataset: str) -> set[str]:
 def _ready_index(
     dataset: str, store_name: str, chunk_size: int, overlap: int,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
+    chunking_method: str = FIXED_CHUNKING,
 ) -> tuple[Any, int, bool]:
     path = resolve_corpus_path(dataset)
     stat = path.stat()
@@ -349,6 +361,7 @@ def _ready_index(
         *embedding_signature(model_name),
         chunk_size,
         overlap,
+        chunking_method,
         stat.st_size,
         stat.st_mtime_ns,
         corpus_total,
@@ -365,6 +378,7 @@ def sparse_index(
     weights_mtime: int,
     chunk_size: int,
     overlap: int,
+    chunking_method: str,
     corpus_size: int,
     corpus_mtime: int,
     corpus_document_count: int,
@@ -378,6 +392,7 @@ def sparse_index(
         weights_mtime,
         chunk_size,
         overlap,
+        chunking_method,
         corpus_size,
         corpus_mtime,
         corpus_document_count,
@@ -410,6 +425,7 @@ def _get_hits(
     query_text: str = "",
     retrieval_method: str = "Dense",
     model_name: str = DEFAULT_EMBEDDING_MODEL,
+    chunking_method: str = FIXED_CHUNKING,
 ) -> tuple[list[dict[str, Any]], int]:
     if retrieval_method == "Direct source search":
         corpus_path = resolve_corpus_path(dataset)
@@ -426,6 +442,7 @@ def _get_hits(
             *embedding_signature(model_name),
             chunk_size,
             overlap,
+            chunking_method,
             corpus_stat.st_size,
             corpus_stat.st_mtime_ns,
             corpus_total,
@@ -435,10 +452,14 @@ def _get_hits(
         sparse_hits = sparse.search(query_text, candidate_count)
         if retrieval_method == "BM25":
             return sparse_hits, len(sparse.documents)
-        dense_store, _, _ = _ready_index(dataset, store_name, chunk_size, overlap, model_name)
+        dense_store, _, _ = _ready_index(
+            dataset, store_name, chunk_size, overlap, model_name, chunking_method
+        )
         dense_hits = dense_store.search(query_vector, candidate_count)
         return hybrid_search(dense_hits, sparse_hits, count), len(sparse.documents)
-    store, chunk_count, _ = _ready_index(dataset, store_name, chunk_size, overlap, model_name)
+    store, chunk_count, _ = _ready_index(
+        dataset, store_name, chunk_size, overlap, model_name, chunking_method
+    )
     return store.search(query_vector, count), chunk_count
 
 
@@ -458,9 +479,10 @@ def _run_retrieval_evaluation(
         raise ValueError("Select at least one Top K value greater than zero.")
     recalls = {cutoff: [] for cutoff in cutoffs}
     ndcgs = {cutoff: [] for cutoff in cutoffs}
+    record_count = 0
     for row in rows:
         query = encode_query(embedder, str(row["question"]))
-        hits, _ = _get_hits(
+        hits, record_count = _get_hits(
             dataset,
             store_name,
             chunk_size,
@@ -477,6 +499,7 @@ def _run_retrieval_evaluation(
             ndcgs[cutoff].append(ndcg_at_n(hits, relevant, cutoff))
     return {
         "questions": len(rows),
+        "Records": record_count,
         "metrics_at_k": {
             cutoff: {
                 "recall": sum(recalls[cutoff]) / len(recalls[cutoff]) if recalls[cutoff] else 0.0,
@@ -600,6 +623,7 @@ with st.sidebar:
         )
         direct_source_search = answer_mode == "Direct source search"
         if direct_source_search:
+            chunking_method = FIXED_CHUNKING
             retrieval_method = "Direct source search"
             store_names = ["Direct source search"]
             st.caption(
@@ -620,6 +644,24 @@ with st.sidebar:
             store_names = ["BM25"] if retrieval_method == "BM25" else list(vector_stores)
             if retrieval_method == "BM25":
                 st.caption("BM25 runs alone; vector-store selections do not apply.")
+            chunking_method = st.selectbox(
+                "Chunking method", CHUNKING_METHODS, index=0, key="ask_chunking_method"
+            )
+            chunking_hints = {
+                FIXED_CHUNKING: (
+                    "Splits text into fixed token-sized chunks with the selected overlap. "
+                    "Fast and predictable; selected by default."
+                ),
+                SEMANTIC_CHUNKING: (
+                    "Groups neighboring sentences by embedding similarity and starts a new chunk "
+                    "when their meaning changes. Uses sentence embeddings, so it is slower than fixed chunking."
+                ),
+                RECURSIVE_CHUNKING: (
+                    "Splits by paragraph, then sentence, then word as needed to respect the "
+                    "embedding model's token limit. Chunk size and overlap still apply."
+                ),
+            }
+            st.caption(chunking_hints[chunking_method])
         selected_models = st.multiselect(
             "Answer models", model_options,
             default=["rotation::answer"] if "rotation::answer" in model_options else [],
@@ -832,11 +874,12 @@ def _prepare_experiment(
     chunk_size: int,
     overlap: int,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
+    chunking_method: str = FIXED_CHUNKING,
 ) -> tuple[list[dict[str, Any]], Any, Any]:
     corpus_path = resolve_corpus_path(dataset)
     corpus_stat = corpus_path.stat()
     chunks, vectors = embedded_corpus(
-        dataset, *embedding_signature(model_name), chunk_size, overlap,
+        dataset, *embedding_signature(model_name), chunk_size, overlap, chunking_method,
         corpus_stat.st_size, corpus_stat.st_mtime_ns, corpus_total,
     )
     query_embedder = embedding_model(*embedding_signature(model_name))
@@ -849,8 +892,9 @@ def _benchmark_table(results: list[dict[str, Any]]) -> pd.DataFrame:
         values = item["results"].get("metrics_at_k", {})
         row = {
             "Run ID": item["run_id"], "Dataset": item["config"]["dataset"],
-        "Vector store": item["config"]["store_name"], "Chunk size": item["config"]["chunk_size"],
+            "Vector store": item["config"]["store_name"], "Chunk size": item["config"]["chunk_size"],
             "Overlap": item["config"]["overlap"], "Search limit": item["config"]["top_k"],
+            "Records": item["results"]["documents"],
             "Questions": item["results"]["queries"], "Repeats": item["results"]["successful_repeats"],
             "Index build (s)": item["results"]["index_build_seconds_median"],
             "Search p50 (ms)": item["results"]["search_latency_ms_p50"],
@@ -1148,10 +1192,12 @@ if workspace == "Ask":
                     "question": question.strip(), "query": question.strip(), "stores": list(store_names),
                     "models": list(selected_models), "retrieval_method": retrieval_method,
                     "answer_mode": answer_mode,
+                    "chunking_method": chunking_method,
                     "hits": {}, "answers": {}, "errors": {}, "chunks": {},
                     "config": {
                         "dataset": dataset_title,
                         "embedding_model": None if direct_source_search else selected_embedding_model,
+                        "chunking_method": chunking_method,
                         "chunk_size": chunk_size, "overlap": overlap, "top_k": top_k,
                         "reranking_enabled": use_reranking,
                         "reranker_model": reranker_name if use_reranking else None,
@@ -1192,6 +1238,7 @@ if workspace == "Ask":
                                 candidates, count = _get_hits(
                                     dataset, store_name, chunk_size, overlap, query_vector, candidate_limit,
                                     payload["query"], retrieval_method, selected_embedding_model,
+                                    chunking_method,
                                 )
                             if selected_reranker:
                                 hits = rerank_candidates(
@@ -1242,6 +1289,7 @@ if workspace == "Ask":
             st.caption(
                 f"{config.get('dataset', dataset_title)} · {payload.get('answer_mode', 'RAG')} · "
                 f"{embedding_label} · {payload.get('retrieval_method', 'Dense')} · "
+                f"{payload.get('chunking_method', FIXED_CHUNKING)} · "
                 f"chunk {config.get('chunk_size', '—')} / overlap {config.get('overlap', '—')} / top {config.get('top_k', '—')} · "
                 f"reranking {'on' if config.get('reranking_enabled') else 'off'}"
             )
@@ -1433,9 +1481,10 @@ elif workspace == "Evaluation & benchmark":
                     for store_name in qa_store_names:
                         verdicts = []
                         store_error = None
+                        record_count = 0
                         try:
                             for row, query_vector in zip(sample, encoded, strict=True):
-                                hits, _ = _get_hits(
+                                hits, record_count = _get_hits(
                                     dataset, store_name, qa_chunk_size, qa_overlap, query_vector,
                                     qa_top_k, str(row["question"]), qa_method, selected_embedding_model,
                                 )
@@ -1457,6 +1506,7 @@ elif workspace == "Evaluation & benchmark":
                             results.append({
                                 "Search backend": store_name, "Retrieval method": qa_method,
                                 "Top K": qa_top_k, "Chunk size": qa_chunk_size, "Overlap": qa_overlap,
+                                "Records": record_count,
                                 "QA accuracy": qa_accuracy(verdicts), "Questions judged": len(verdicts),
                                 "Answer model": qa_model, "Judge model": qa_judge_model,
                                 "Error": store_error or "",

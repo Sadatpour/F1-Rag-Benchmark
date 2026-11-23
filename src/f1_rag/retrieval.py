@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from f1_rag.chunking import chunk_documents
+from f1_rag.chunking import CHUNKING_METHODS, FIXED_CHUNKING, chunk_documents
 from f1_rag.embeddings import (
     EMBEDDING_MODEL_ID,
     EMBEDDING_MODEL_PATH,
@@ -29,14 +29,17 @@ def _fingerprint(
     embedding_model_id: str = EMBEDDING_MODEL_ID,
     embedding_model_path: Path = EMBEDDING_MODEL_PATH,
     embedding_weights_path: Path = EMBEDDING_WEIGHTS_PATH,
+    chunking_method: str = FIXED_CHUNKING,
 ) -> str:
+    if chunking_method not in CHUNKING_METHODS:
+        raise ValueError(f"Unknown chunking method {chunking_method!r}.")
     stat = corpus_path.stat()
     weights_stat = embedding_weights_path.stat() if embedding_weights_path.is_file() else None
     weights_signature = (
         f"{weights_stat.st_size}:{weights_stat.st_mtime_ns}" if weights_stat else "not-present"
     )
     payload = (
-        f"token-chunking-v2:{corpus_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
+        f"chunking-v3:{chunking_method}:{corpus_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
         f"{chunk_size}:{overlap}:{embedding_model_id}:{embedding_model_path.resolve()}:"
         f"{embedding_weights_path.resolve()}:{weights_signature}"
     )
@@ -55,6 +58,7 @@ def embed_documents(
     overlap: int,
     batch_size: int = 128,
     on_progress: Callable[[int], None] | None = None,
+    chunking_method: str = FIXED_CHUNKING,
 ) -> tuple[list[dict[str, Any]], np.ndarray]:
     if batch_size < 1:
         raise ValueError("batch_size must be greater than zero.")
@@ -82,6 +86,8 @@ def embed_documents(
             overlap=overlap,
             tokenizer=tokenizer,
             max_tokens=max_tokens,
+            method=chunking_method,
+            semantic_encoder=embedder.encode if chunking_method == "Semantic chunking" else None,
         )
         chunks.extend(document_chunks)
         pending.extend(document_chunks)
@@ -111,11 +117,12 @@ def prepare_index(
     embedding_model_id: str = EMBEDDING_MODEL_ID,
     embedding_model_path: Path = EMBEDDING_MODEL_PATH,
     embedding_weights_path: Path = EMBEDDING_WEIGHTS_PATH,
+    chunking_method: str = FIXED_CHUNKING,
 ) -> tuple[Any, int, bool]:
     corpus_path = resolve_corpus_path(dataset, knowledge_base)
     fingerprint = _fingerprint(
         corpus_path, chunk_size, overlap,
-        embedding_model_id, embedding_model_path, embedding_weights_path,
+        embedding_model_id, embedding_model_path, embedding_weights_path, chunking_method,
     )
     store = create_store(store_name, _index_path(dataset, store_name, fingerprint))
     if store.load(fingerprint):
@@ -135,6 +142,7 @@ def prepare_index(
             embedder,
             chunk_size,
             overlap,
+            chunking_method=chunking_method,
         )
     else:
         chunks, vectors = precomputed
