@@ -85,6 +85,8 @@ streamlit run app.py
 - Compare vector-store index build time, search p50/p95, process RAM/CPU, Recall@K, and NDCG@K with the same corpus vectors and questions.
 - Tune chunk size, overlap, top-k, and vector store on a deterministic tuning split. Run a selected configuration once on the separate holdout split.
 - Record settings, metrics, run IDs, and hardware/software details in `knowledge_base/runs/runs.jsonl`.
+- Export every evaluation table as CSV or PDF. Evaluation results and their settings are saved in `knowledge_base/runs/evaluations.jsonl` and can be reopened from the saved test history.
+- Show progress while retrieval, answer-accuracy, benchmark, tuning, and final holdout tests run; failed backends remain visible in partial results and saved run records.
 
 ### Jolpica attribution
 
