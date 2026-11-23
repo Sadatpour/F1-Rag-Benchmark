@@ -23,7 +23,7 @@ from f1_rag.providers import (
 )
 from f1_rag.evaluation import ndcg_ids_at_n, recall_ids_at_n
 from f1_rag.reranking import DEFAULT_RERANKER_MODEL, RERANKER_PROFILES, rerank_candidates
-from f1_rag.sparse import BM25Index, hybrid_search
+from f1_rag.sparse import BM25Index, build_source_search_index, hybrid_search
 from f1_rag.stores import create_store
 
 
@@ -39,6 +39,16 @@ class HybridRetrievalTests(unittest.TestCase):
         hits = BM25Index(self.documents).search("world champion", 2)
         self.assertEqual(hits[0]["id"], "d1")
         self.assertGreater(hits[0]["score"], 0)
+
+    def test_bm25_returns_no_hits_when_the_source_has_no_matching_terms(self) -> None:
+        self.assertEqual(BM25Index(self.documents).search("unrelated xyz", 3), [])
+
+    def test_direct_source_search_indexes_word_chunks_without_vectors(self) -> None:
+        index = build_source_search_index(self.documents, chunk_size=2, overlap=0)
+        hits = index.search("world champion", 1)
+
+        self.assertEqual(hits[0]["source"], "one")
+        self.assertEqual(hits[0]["text"], "world champion")
 
     def test_rrf_merges_rankings_and_deduplicates_documents(self) -> None:
         dense = [self.documents[1], self.documents[0]]
