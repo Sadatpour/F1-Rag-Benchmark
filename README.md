@@ -78,6 +78,8 @@ streamlit run app.py
 - Build indexes by streaming corpus records and embedding batches with visible progress. Wikipedia remains the default source for a smaller first index.
 - View each configured model's context window when OpenRouter provides it.
 - Compare Dense, BM25, and Hybrid (BM25 + dense) retrieval. Hybrid ranking uses Reciprocal Rank Fusion.
+- Choose fixed (default), semantic, or recursive chunking in RAG; each method explains its behavior in the interface.
+- Evaluation and benchmark reports include the number of indexed chunk records alongside evaluated question counts.
 - Choose RAG retrieval or direct BM25 search over the selected local corpus. Direct source search uses word-based chunks without loading an embedding model; the LLM answers only from matching passages.
 - Require answers to be supported directly by the selected passages. When none answers the question, the app returns `NOT_FOUND` and suppresses source citations.
 - Optionally rerank a candidate pool with a local CrossEncoder before sending the final Top K chunks to answer models. The configured MS MARCO MiniLM model scores query/chunk pairs; it does not replace the embedding model or retrieve documents on its own.

@@ -300,6 +300,7 @@ class BenchmarkTests(unittest.TestCase):
             rows = (Path(temporary) / "runs.jsonl").read_text(encoding="utf-8").splitlines()
 
         self.assertIsNone(result["error"])
+        self.assertEqual(result["results"]["documents"], len(documents))
         self.assertEqual(result["results"]["successful_repeats"], 2)
         self.assertEqual(result["results"]["recall_at_k"], 1.0)
         self.assertEqual(result["results"]["metrics_at_k"]["1"]["recall"], 1.0)
