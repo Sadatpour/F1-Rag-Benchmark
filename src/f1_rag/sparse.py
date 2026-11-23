@@ -6,6 +6,8 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
+from f1_rag.chunking import chunk_documents
+
 
 _TOKEN_PATTERN = re.compile(r"[\w]+", flags=re.UNICODE)
 
@@ -64,6 +66,14 @@ class BM25Index:
             {**self.documents[index], "score": score}
             for score, index in scored[:limit]
         ]
+
+
+def build_source_search_index(
+    documents: list[dict[str, Any]],
+    chunk_size: int,
+    overlap: int,
+) -> BM25Index:
+    return BM25Index(chunk_documents(documents, chunk_size, overlap))
 
 
 def reciprocal_rank_fusion(
